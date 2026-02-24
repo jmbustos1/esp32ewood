@@ -1,0 +1,4 @@
+#include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
+ #include "freertos/FreeRTOS.h" #include "freertos/task.h" #include "freertos/semphr.h" #include "freertos/queue.h" #include "driver/uart.h" #include "driver/gpio.h" #include "esp_log.h" #include "esp_timer.h" static const char *TAG = "SIM7600";
