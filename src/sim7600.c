@@ -22,6 +22,8 @@
 #include "app_config.h"
 #include "connectivity.h"
 #include "sim7600.h"
+#include "gps.h"
+#include "periph_uart.h"
 
 static const char *TAG = "SIM7600";
 
@@ -33,10 +35,7 @@ static boot_state_t current_state = STATE_BOOT;
 static bool rx_pending[MAX_LINKS] = {false};
 static int rest_len[MAX_LINKS] = {0};
 static bool buffer_mode_active = false;
-static const location_t locations[2] = {
-    {-36.8201, -73.0444},
-    {-36.8300, -73.0500}
-};
+/* Ubicaciones hardcodeadas eliminadas: ahora se usa gps.h + periph_uart.h */
 
 // Función para enviar comando y leer respuesta
 // CRÍTICO: Toda operación AT debe estar protegida con uart_mutex para evitar intercalación
@@ -396,6 +395,70 @@ sim7600_response_t sim7600_test_pdp_context(char *response, size_t response_size
     char cmd[] = "AT+CGDCONT=?\r\n";
     ESP_LOGI(TAG, "Verificando valores soportados para AT+CGDCONT...");
     return sim7600_send_command(cmd, response, response_size, RESPONSE_TIMEOUT_MS);
+}
+
+// ============================================================================
+// AT+CGAUTH - Set type of authentication for PDP-IP connections
+// ============================================================================
+
+/**
+ * @brief Configura autenticacion PAP/CHAP para el contexto PDP.
+ *        Necesario para SIMs M2M que requieren usuario y clave.
+ *
+ * @param cid Context ID (normalmente 1)
+ * @param auth_type 0=none, 1=PAP, 2=CHAP, 3=PAP or CHAP
+ * @param user Usuario
+ * @param password Clave
+ * @return sim7600_response_t
+ */
+sim7600_response_t sim7600_set_auth(int cid, int auth_type, const char *user, const char *password)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "AT+CGAUTH=%d,%d,\"%s\",\"%s\"\r\n",
+             cid, auth_type, password ? password : "", user ? user : "");
+    ESP_LOGI(TAG, "Configurando autenticacion PDP (cid=%d, type=%d, user=%s)...",
+             cid, auth_type, user ? user : "");
+    return sim7600_send_command(cmd, shared_response_buffer, sizeof(shared_response_buffer), RESPONSE_TIMEOUT_MS);
+}
+
+// ============================================================================
+// AT+CREG - Network Registration Status
+// ============================================================================
+
+/**
+ * @brief Verifica si el modulo esta registrado en la red celular.
+ *
+ * Envia AT+CREG? y parsea la respuesta +CREG: <n>,<stat>
+ * stat: 0=not registered, 1=registered home, 2=searching, 3=denied, 5=registered roaming
+ *
+ * @return 1 si registrado (stat==1 o stat==5), 0 si no
+ */
+int sim7600_is_registered(void)
+{
+    char buf[256];
+    sim7600_response_t r = sim7600_send_command("AT+CREG?\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS);
+    if (r != SIM7600_OK) {
+        ESP_LOGW(TAG, "AT+CREG? fallo");
+        return 0;
+    }
+
+    /* Buscar +CREG: <n>,<stat> */
+    char *creg = strstr(buf, "+CREG:");
+    if (creg == NULL) return 0;
+
+    int n = 0, stat = 0;
+    if (sscanf(creg, "+CREG: %d,%d", &n, &stat) < 2) {
+        /* Intentar sin espacio */
+        sscanf(creg, "+CREG:%d,%d", &n, &stat);
+    }
+
+    ESP_LOGI(TAG, "Registro celular: stat=%d (%s)", stat,
+             stat == 1 ? "home" :
+             stat == 5 ? "roaming" :
+             stat == 2 ? "searching" :
+             stat == 3 ? "denied" : "not registered");
+
+    return (stat == 1 || stat == 5) ? 1 : 0;
 }
 
 // ============================================================================
@@ -1634,9 +1697,15 @@ void sim7600_command_processor_task(void *pvParameters)
                 }
                 
                 if (cmd_name != NULL) {
-                    // Aquí puedes agregar la lógica real: GPIO/relé, etc.
-                    sim7600_response_t ack_result = sim7600_send_ack(cmd_item.command_id, cmd_name, cmd_item.timestamp, 
-                                                                      cmd_item.client_id, cmd_item.request_id, 
+                    // Enviar comando a actuadores via UART1
+                    if (strcmp(cmd_name, "unlock") == 0) {
+                        periph_send_unlock();
+                    } else if (strcmp(cmd_name, "lock") == 0) {
+                        periph_send_lock();
+                    }
+                    // Enviar ACK al servidor
+                    sim7600_response_t ack_result = sim7600_send_ack(cmd_item.command_id, cmd_name, cmd_item.timestamp,
+                                                                      cmd_item.client_id, cmd_item.request_id,
                                                                       cmd_item.message_id);
                     if (ack_result == SIM7600_OK) {
                         ESP_LOGI(TAG, "✅ ACK inmediato enviado (ID: %s, message_id: %d)", 
@@ -1873,10 +1942,21 @@ sim7600_response_t sim7600_send_scooter_update(int link_num, int scooter_id,
     char json_buffer[256];
     int json_len;
     
-    // Construir JSON de telemetría (sin ACKs - los ACKs se envían inmediatamente)
+    // Obtener estado de lock y voltaje para incluir en telemetria
+    lock_state_t lk = periph_get_lock_state();
+    const char *lock_str = (lk == LOCK_STATE_LOCKED)   ? "locked" :
+                           (lk == LOCK_STATE_UNLOCKED) ? "unlocked" : "unknown";
+    bms_power_t bms = periph_get_bms_power();
+
+    // Construir JSON de telemetría con datos reales + device_secret
     json_len = snprintf(json_buffer, sizeof(json_buffer),
-                       "{\"scooter_id\":%d,\"latitude\":%.6f,\"longitude\":%.6f,\"battery_level\":%d,\"speed_kmh\":%.1f}\n",
-                       scooter_id, latitude, longitude, battery, speed_kmh);
+                       "{\"scooter_id\":%d,\"device_secret\":\"%s\","
+                       "\"latitude\":%.6f,\"longitude\":%.6f,"
+                       "\"battery_level\":%d,\"speed_kmh\":%.1f,"
+                       "\"lock_state\":\"%s\",\"voltage\":%.2f}\n",
+                       scooter_id, DEVICE_SECRET,
+                       latitude, longitude, battery, speed_kmh,
+                       lock_str, bms.valid ? bms.voltage : 0.0f);
     
     // Verificar que el JSON sea válido (debe tener al menos el formato básico)
     if (json_len <= 0) {
@@ -1928,18 +2008,16 @@ sim7600_response_t sim7600_send_scooter_update(int link_num, int scooter_id,
 void sim7600_scooter_update_loop(const char *server_ip, int server_port)
 {
     sim7600_response_t result;
-    int location_index = 0;
     int update_count = 0;
     
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "=== Scooter Update Service ===");
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "🛴 Scooter ID: %d", SCOOTER_ID);
-    ESP_LOGI(TAG, "📍 Ubicaciones alternadas: 2 puntos");
-    ESP_LOGI(TAG, "🔋 Batería: %d%%", SCOOTER_BATTERY);
-    ESP_LOGI(TAG, "⚡ Velocidad: %.1f km/h", SCOOTER_SPEED_KMH);
-    ESP_LOGI(TAG, "🔄 Intervalo: %d segundos", UPDATE_INTERVAL_SEC);
-    ESP_LOGI(TAG, "🌐 Servidor: %s:%d", server_ip, server_port);
+    ESP_LOGI(TAG, "Scooter ID: %d", SCOOTER_ID);
+    ESP_LOGI(TAG, "Fuente GPS: SIM7600 AT+CGPSINFO (real)");
+    ESP_LOGI(TAG, "Fuente BMS: UART1 protocolo binario");
+    ESP_LOGI(TAG, "Intervalo: %d segundos", UPDATE_INTERVAL_SEC);
+    ESP_LOGI(TAG, "Servidor: %s:%d", server_ip, server_port);
     ESP_LOGI(TAG, "========================================\n");
 
     connectivity_init();
@@ -2125,26 +2203,40 @@ void sim7600_scooter_update_loop(const char *server_ip, int server_port)
         
         // PRIORIDAD 3: Enviar telemetría (si no hay datos RX pendientes)
         if (!rx_pending[0]) {
-            // Obtener ubicación alternada
-            const location_t *loc = &locations[location_index];
-            location_index = (location_index + 1) % 2;  // Alternar entre 0 y 1
-            
-            ESP_LOGI(TAG, "📍 Lat: %.6f, Lon: %.6f", loc->latitude, loc->longitude);
-            
+            // Obtener posicion GPS real (ultimo fix valido)
+            gps_update();  // Intenta obtener nuevo fix; si falla, mantiene el anterior
+            gps_position_t pos = gps_get_position();
+
+            // Obtener SoC real del BMS (ultimo valor recibido)
+            bms_power_t bms = periph_get_bms_power();
+            int battery = bms.valid ? bms.soc : 0;
+            float speed = pos.valid ? pos.speed_kmh : 0.0f;
+
+            if (pos.valid) {
+                ESP_LOGI(TAG, "GPS: %.6f, %.6f | %.1f km/h | BMS: %d%%",
+                         pos.latitude, pos.longitude, speed, battery);
+            } else {
+                ESP_LOGW(TAG, "Sin fix GPS, enviando ultima posicion conocida (BMS: %d%%)", battery);
+            }
+
             current_state = STATE_TX_PREPARE;
-            // Enviar actualización
-            result = sim7600_send_scooter_update(0, SCOOTER_ID, 
-                                                loc->latitude, loc->longitude,
-                                                SCOOTER_BATTERY, SCOOTER_SPEED_KMH);
+            result = sim7600_send_scooter_update(0, SCOOTER_ID,
+                                                pos.latitude, pos.longitude,
+                                                battery, speed);
             current_state = STATE_RUN_IDLE;
             
             if (result != SIM7600_OK) {
                 ESP_LOGE(TAG, "✗ Error enviando actualización #%d", update_count);
+                if (result == SIM7600_TIMEOUT) {
+                    connectivity_notify_at_timeout();
+                }
                 /* Decidir si es fallo de red o de socket: comprobar netopen_status */
                 char net_status[256];
                 bool network_error = false;
-                if (sim7600_netopen_status(net_status, sizeof(net_status)) == SIM7600_OK &&
-                    strstr(net_status, "+NETOPEN: 0") != NULL) {
+                sim7600_response_t net_r = sim7600_netopen_status(net_status, sizeof(net_status));
+                if (net_r == SIM7600_TIMEOUT) {
+                    connectivity_notify_at_timeout();
+                } else if (net_r == SIM7600_OK && strstr(net_status, "+NETOPEN: 0") != NULL) {
                     /* Red cerrada (o respuesta indica red no abierta) */
                     network_error = true;
                 }

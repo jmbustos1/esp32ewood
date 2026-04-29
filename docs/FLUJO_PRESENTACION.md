@@ -1,66 +1,87 @@
 # Flujo del sistema IoT — Scooter (ESP32 + SIM7600)
 
-**Para presentación — lenguaje simple, audiencia no técnica**
+**Para presentacion — lenguaje simple, audiencia no tecnica**
 
 ---
 
-## ¿Qué es esto?
+## Que es esto?
 
-- Un **scooter** (o vehículo) que lleva un dispositivo con **ESP32** (cerebro) y **SIM7600** (módulo 4G).
-- Se comunica con un **servidor en la nube** para reportar su posición y recibir órdenes (por ejemplo: desbloquear o bloquear).
+- Un **scooter electrico** que lleva un dispositivo con **ESP32** (cerebro), **SIM7600** (modulo 4G con GPS integrado) y un **sistema de gestion de bateria (BMS)**.
+- Se comunica con un **servidor en la nube** para reportar su posicion y estado, y recibir ordenes.
+- Lee datos reales de la bateria y controla el bloqueo/desbloqueo fisico del scooter.
 
 ---
 
-## Flujo en 6 puntos
+## Flujo en 7 puntos
 
 1. **Arranque**
-   - El dispositivo se enciende, se conecta por 4G a la red del operador y abre una conexión con el servidor.
+   - El dispositivo se enciende, activa el GPS, conecta con el BMS y se conecta por 4G al servidor.
 
-2. **Envío de posición (cada 5 segundos)**
-   - El scooter envía al servidor: ubicación (lat/lon), batería y velocidad.
-   - El servidor usa estos datos para mostrar el scooter en un mapa en tiempo casi real.
+2. **Envio de posicion y estado (cada 5 segundos)**
+   - El scooter envia al servidor: ubicacion GPS real, porcentaje de bateria, velocidad, voltaje y si esta bloqueado o desbloqueado.
+   - El servidor usa estos datos para mostrar el scooter en un mapa en tiempo real.
 
-3. **Recepción de comandos**
-   - El servidor puede enviar órdenes al scooter en cualquier momento (por ejemplo: “desbloquear” o “bloquear”).
-   - El dispositivo revisa con frecuencia si llegó alguna orden, para responder rápido.
+3. **Lectura de bateria**
+   - El BMS (sistema de gestion de bateria) reporta continuamente: nivel de carga, voltaje, corriente y estado de proteccion.
+   - Si la bateria tiene un problema (sobrevoltaje, temperatura, etc.), el sistema lo detecta automaticamente.
 
-4. **Confirmación al servidor**
-   - Cuando el scooter recibe una orden, responde de inmediato: “recibí y ejecuté la orden”.
-   - Así el backend (y la app) saben que el comando llegó bien.
+4. **Recepcion de comandos**
+   - El servidor puede enviar ordenes al scooter en cualquier momento: "desbloquear" o "bloquear".
+   - El dispositivo revisa con frecuencia si llego alguna orden.
 
-5. **Reconexión automática**
-   - Si se pierde la conexión (4G o servidor), el dispositivo intenta reconectarse solo, sin intervención del usuario.
+5. **Ejecucion del comando**
+   - Cuando llega una orden de desbloqueo, el ESP32 la reenvia al sistema de actuadores del scooter, que ejecuta la accion fisicamente.
+   - Inmediatamente confirma al servidor: "recibido y ejecutado".
 
-6. **Resumen**
-   - **Ida:** el scooter manda posición y estado cada pocos segundos.  
-   - **Vuelta:** el servidor manda comandos (unlock/lock) y el scooter los ejecuta y confirma.
+6. **Reconexion automatica**
+   - Si se pierde la conexion (4G o servidor), el dispositivo intenta reconectarse solo, con tiempos de espera crecientes para no saturar la red.
+
+7. **Ultimo dato conocido**
+   - Si el GPS pierde senal momentaneamente o el BMS no responde, el sistema sigue reportando el ultimo dato valido. Nunca deja de enviar informacion.
 
 ---
 
-## Esquema muy simple
-
-
+## Esquema
 
 ```
-[Scooter / ESP32 + SIM7600]  <——4G——>  [Servidor en la nube]
-        |                                      |
-        |  Envía: posición, batería, velocidad (cada 5 s)
-        |  ————————————————————————————>
-        |                                      |
-        |  Recibe: "desbloquear" / "bloquear"  |
-        |  <————————————————————————————
-        |                                      |
-        |  Envía: "OK, ejecutado" (ACK)        |
-        |  ————————————————————————————>
+[Scooter / ESP32]
+     |
+     ├── UART2 ←→ [SIM7600 (4G + GPS)]  ←——4G——→  [Servidor en la nube]
+     |                                                     |
+     |    Envia: posicion, bateria, velocidad, lock_state (cada 5s)
+     |    ——————————————————————————————————>
+     |                                                     |
+     |    Recibe: "desbloquear" / "bloquear"               |
+     |    <——————————————————————————————————
+     |                                                     |
+     |    Envia: "OK, ejecutado" (ACK)                     |
+     |    ——————————————————————————————————>
+     |
+     └── UART1 ←→ [Electronica del scooter]
+                       |
+                       ├── BMS: bateria, voltaje, temperatura
+                       └── Actuador: lock / unlock fisico
 ```
 
-**Sobre el ">"** — Cada vez que el scooter envía algo (posición o ACK), por dentro pasa esto: el ESP32 le dice al módulo 4G "prepárate"; el módulo responde **">"** (listo, escribe); entonces el ESP32 escribe y envía el mensaje. El **">"** es solo esa señal de "listo" del módulo.
+---
+
+## Datos que envia el scooter
+
+| Dato | Fuente | Ejemplo |
+|------|--------|---------|
+| Ubicacion (lat/lon) | GPS del SIM7600 | -36.886767, -73.044400 |
+| Velocidad | GPS | 15.3 km/h |
+| Bateria (%) | BMS via UART | 50% |
+| Voltaje | BMS via UART | 39.11 V |
+| Estado candado | Actuador via UART | bloqueado / desbloqueado |
 
 ---
 
 ## Mensajes clave para la audiencia
 
-- El scooter **no está solo**: habla con la nube de forma continua.
-- La **posición** se actualiza cada pocos segundos para el mapa.
-- Las **órdenes** (unlock/lock) se reciben y se **confirman** al instante.
-- Si hay fallos de red, el sistema **reintenta solo** para volver a conectar.
+- El scooter **reporta datos reales** de GPS y bateria, no simulados.
+- La **posicion** se actualiza cada 5 segundos para el mapa.
+- Las **ordenes** (desbloquear/bloquear) se ejecutan fisicamente en el scooter y se **confirman** al instante.
+- Si hay fallos de red, el sistema **reintenta solo** con tiempos crecientes.
+- Si pierde GPS o BMS momentaneamente, **sigue reportando** con el ultimo dato valido.
+- La comunicacion con la bateria y actuadores usa un **protocolo industrial** con validacion de datos (checksum).

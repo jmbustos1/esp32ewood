@@ -1,74 +1,122 @@
 # Contexto del proyecto esp32ewood
 
-Documento de contexto para retomar el proyecto sin perder el hilo. Actualizado el 2026-03-16 basándose en el código fuente real.
+Documento de contexto para retomar el proyecto sin perder el hilo.
 
 ---
 
-## 1. Qué es el proyecto
+## 1. Que es el proyecto
 
-- **Objetivo:** Dispositivo IoT montado en un scooter que se comunica con un servidor en la nube por 4G.
-- **Hardware:** ESP32 (DOIT DEVKIT V1) + módulo celular **SIM7600** (UART).
-- **Framework:** ESP-IDF vía PlatformIO.
+- **Objetivo:** Dispositivo IoT en un scooter que se comunica con un servidor en la nube por 4G.
+- **Hardware:** ESP32 (DOIT DEVKIT V1) + modulo celular **SIM7600** (UART) + electronica BMS/actuadores (UART).
+- **Framework:** ESP-IDF via PlatformIO.
 - **Funciones principales:**
-  - Enviar telemetría al servidor cada 5 s: posición (lat/lon), batería, velocidad (JSON).
-  - Recibir comandos del servidor (unlock, lock) y ejecutarlos.
+  - Enviar al servidor telemetria cada 5 s: posicion GPS real, bateria (BMS), velocidad, estado lock, voltaje.
+  - Recibir comandos del servidor (unlock, lock) y reenviarlos a actuadores via UART1.
   - Enviar ACK inmediato en NDJSON por cada comando recibido.
-  - Reconexión automática con máquina de estados y backoff.
+  - Leer datos del BMS (SoC, voltaje, corriente, proteccion) via protocolo binario.
 
 ---
 
-## 2. Estructura de archivos
+## 2. Arquitectura de UARTs
+
+| UART | Uso | Pines | Baudrate |
+|------|-----|-------|----------|
+| UART0 | Debug console USB | GPIO1 / GPIO3 (fijos) | 115200 |
+| UART2 | SIM7600 (TCP + GPS) | TX=GPIO17, RX=GPIO16 | 115200 |
+| UART1 | Electronica (BMS, actuadores, IMU) | TX=GPIO4, RX=GPIO5 | 115200 |
+
+---
+
+## 3. Estructura de archivos
 
 ```text
 src/
-  app_config.h       — Configuración centralizada (UART, pines, constantes, backoff).
-  sim7600.h          — API pública del driver SIM7600 (tipos, prototipos).
-  sim7600.c          — Implementación completa del driver (AT, buffer, TCP, comandos, loop).
-  connectivity.h     — Máquina de estados de conectividad (enum, prototipos).
-  connectivity.c     — Implementación de recuperación con backoff.
-  main.c             — app_main: init UART, prueba AT, PDP, arranca loop.
-docs/
-  CONTEXTO_PROYECTO.md   — Este archivo.
-  DISEÑO_FALLAS_Y_MODULOS.md — Diseño original de fallas y separación en módulos.
-  FLUJO_PRESENTACION.md  — Flujo simplificado para audiencia no técnica.
+  main.c              — app_main: init UARTs, GPS, BMS polling, PDP+auth, lanza update loop
+  app_config.h         — Defines: pines, UARTs, APN, servidor, intervalos, constantes
+  sim7600.h / sim7600.c — Driver SIM7600: AT commands, TCP, buffer mode, telemetria, comandos servidor, ACK
+  gps.h / gps.c        — GPS via AT+CGPSINFO: init, update, get_position (ultimo fix valido)
+  frame_protocol.h/.c  — Protocolo binario de frames: parser incremental, builder, Fletcher-16
+  periph_uart.h/.c     — UART1 electronica: lee BMS (SoC, voltaje, proteccion), envia lock/unlock a actuadores
+  connectivity.h/.c    — Maquina de estados de conectividad y recuperacion con backoff
+  CMakeLists.txt       — GLOB_RECURSE, incluye todo *.c automaticamente
 ```
 
 ---
 
-## 3. Comunicación SIM7600 (UART)
+## 4. Comunicacion SIM7600 (UART2)
 
-- **UART:** `UART_NUM_2`. **Pines:** TX = GPIO 17, RX = GPIO 16. **Baudrate:** 115200.
-- **Modo:** No transparente (`AT+CIPMODE=0`), con **modo buffer** (`AT+CIPRXGET=1`).
-- **Recepción:** Los datos entrantes no van directo al UART; el módulo los guarda y notifica con URC `+CIPRXGET: 1,<link>`. El firmware consulta con `AT+CIPRXGET=4,<link>` (longitud) y `AT+CIPRXGET=2,<link>,<len>` (leer datos).
-- **Envío:** `AT+CIPSEND=0,<len>` → esperar prompt `>` → escribir bytes → esperar `+CIPSEND: <link>,<req>,<cnf>`.
-- **Sincronización:** `uart_mutex` (SemaphoreHandle_t) protege el UART. Ver sección de mutex más abajo.
+- **Modo:** No transparente (`AT+CIPMODE=0`) con **modo buffer** (`AT+CIPRXGET=1`).
+- Los datos entrantes se guardan en buffer del modulo; notifica con URC `+CIPRXGET: 1,<link>`.
+- El firmware consulta con `AT+CIPRXGET=4,<link>` (longitud) y `AT+CIPRXGET=2,<link>,<len>` (leer datos).
+- **Flujo de envio:** `AT+CIPSEND=0,<len>` → esperar prompt `>` → escribir bytes → esperar `+CIPSEND:` confirmacion.
+- **Sincronizacion:** `uart_mutex` protege el UART durante secuencias AT completas.
+- La tarea async solo detecta URCs y marca `rx_pending[]`; el drenaje real se hace en el loop principal.
 
 ---
 
-## 4. Dos máquinas de estados
+## 5. GPS (via SIM7600, misma UART2)
 
-El código tiene **dos** máquinas de estados independientes:
+- **Inicio:** `AT+CGPS=1,1` (modo standalone) lo mas temprano posible en el boot.
+- **Lectura:** `AT+CGPSINFO` antes de cada telemetria.
+- **Respuesta:** `+CGPSINFO:<lat>,<N/S>,<lon>,<E/W>,<date>,<time>,<alt>,<speed>,<course>`
+- **Formato lat/lon:** NMEA `ddmm.mmmmmm` → se convierte a grados decimales.
+- **Sin fix:** Campos vacios `+CGPSINFO:,,,,,,,,` → se mantiene ultima posicion valida.
+- **Velocidad:** Viene en nudos, se convierte a km/h (x 1.852).
 
-### 4.1 Máquina de conectividad (`connectivity_state_t` en connectivity.c)
+---
 
-Controla la **recuperación de conexión**. Es la máquina principal de fallas.
+## 6. Protocolo binario electronica (UART1)
 
-```c
-typedef enum {
-    CONNECTIVITY_MODULE_OFFLINE,   // Módulo no responde por UART
-    CONNECTIVITY_MODULE_READY,     // AT OK; falta configurar red/socket
-    CONNECTIVITY_NET_DOWN,         // Red no abierta (NETOPEN falló)
-    CONNECTIVITY_NET_READY,        // Red abierta; falta socket
-    CONNECTIVITY_SOCKET_DOWN,      // Socket cerrado; reintentar CIPOPEN
-    CONNECTIVITY_RUNNING           // Red + socket OK; loop normal
-} connectivity_state_t;
+Comunicacion con microcontrolador BMS/actuadores usando frames binarios:
+
+```
+SOF (2B: 0xA5 0x5A) | LENGTH (2B Big Endian) | TYPE (1B) | PAYLOAD (NB) | CHECKSUM (2B Fletcher-16)
 ```
 
-Estado almacenado en `s_state` (static en connectivity.c).
+**LENGTH** = bytes desde TYPE hasta fin de PAYLOAD (inclusive).
+**CHECKSUM** = Fletcher-16 calculado desde LENGTH hasta fin de PAYLOAD.
 
-### 4.2 Máquina interna del loop (`boot_state_t` en sim7600.h)
+### Tipos (TYPE)
 
-Controla qué **operación** está haciendo el loop en cada momento.
+| Tipo | Codigo | Descripcion |
+|------|--------|-------------|
+| WRITE | 0x01 | Escribir dato en modulo/registro |
+| READ | 0x02 | Solicitar lectura |
+| ANS | 0x03 | Respuesta a solicitud |
+| EVENT | 0x04 | Reporte de evento |
+| ACK | 0x05 | Confirmacion de recepcion |
+| ERROR | 0x06 | Mensaje mal procesado |
+
+### Modulos (MODULE ID en PAYLOAD)
+
+| Modulo | ID | Descripcion |
+|--------|----|-------------|
+| BMS | 0x01 | Bateria: voltaje, corriente, SoC, temperatura, proteccion |
+| Acelerometro/IMU | 0x02 | Datos de movimiento |
+| Actuadores ON/OFF | 0x03 | Lock/unlock fisico del scooter |
+| Sistema | 0xFF | Boot, run, fault, keep-alive |
+
+### Mensajes BMS relevantes
+
+| MSGID | Datos | Uso |
+|-------|-------|-----|
+| 0x02 | Voltaje(2B 10mV), Corriente(2B 10mA), Cap.residual(2B 10mA), SoC(1B %) | battery_level y voltage en telemetria |
+| 0x03 | N sondas(1B), T CMOS(2B 0.1K), T bateria(2B*n 0.1K) | Proteccion termica |
+| 0x05 | ControlStatus(1B), ProtectionStatus(2B), BalanceStatus(4B) | Estado carga/descarga/proteccion |
+
+### Actuadores (MODULE 0x03)
+
+- **Lock:** WRITE con MSGID=0x01
+- **Unlock:** WRITE con MSGID=0x02
+- Respuesta ANS confirma ejecucion
+
+### Parser
+
+Parser incremental (maquina de estados) byte a byte. Resincroniza automaticamente si pierde SOF o checksum invalido.
+
+---
+
+## 7. Maquina de estados interna (boot_state_t)
 
 ```c
 typedef enum {
@@ -79,189 +127,176 @@ typedef enum {
 } boot_state_t;
 ```
 
-**Solo 3 estados se usan realmente en el loop:**
+**Estados activos en el loop:**
 
-| Estado | Significado | Dónde se asigna |
-|--------|-------------|-----------------|
-| `STATE_RUN_IDLE` | Sin operación crítica en curso | Inicio, tras drenar, tras enviar |
-| `STATE_RX_DRAIN` | Drenando buffer RX | Cuando `get_rx_buffer_length(0) > 0` |
-| `STATE_TX_PREPARE` | Enviando telemetría | Justo antes de `send_scooter_update()` |
-
-Los demás estados (`STATE_BOOT`, `STATE_NET_UP`, `STATE_SOCKET_CONNECTING`, `STATE_TX_WAIT_PROMPT`, `STATE_TX_SENDING`, `STATE_TX_WAIT_RESULT`, `STATE_ERROR_RECOVER`) están definidos pero **nunca se asignan**.
+| Estado | Significado |
+|--------|-------------|
+| STATE_RUN_IDLE | Sin operacion critica en curso |
+| STATE_RX_DRAIN | Drenando buffer RX del socket |
+| STATE_TX_PREPARE | Enviando telemetria |
 
 ---
 
-## 5. Loop principal (`sim7600_scooter_update_loop` en sim7600.c)
+## 8. Loop principal
 
-### 5.1 Inicialización (antes del while(1))
-
-1. `connectivity_init()` — estado a MODULE_OFFLINE, resetea backoff.
-2. Crear `uart_mutex` si no existe.
-3. `sim7600_set_cipmode(0)` — modo no transparente.
-4. `sim7600_set_buffer_mode(1)` — activar modo buffer.
-5. `sim7600_netopen()` — activar red. Delays 3s + 2s.
-6. `sim7600_set_dns("8.8.8.8", "8.8.4.4")`. Delay 2s.
-7. `sim7600_cipopen_tcp(0, server_ip, server_port)`. Delay 1s.
-8. Crear `command_queue` (xQueueCreate, tamaño COMMAND_QUEUE_SIZE=20).
-9. Crear tarea `sim7600_command_processor_task` (prioridad 4, stack 4096).
-10. Crear tarea `sim7600_async_read_task` (prioridad 5, stack 4096).
-11. `connectivity_set_state(CONNECTIVITY_RUNNING)`.
-12. `current_state = STATE_RUN_IDLE`.
-
-### 5.2 Loop while(1)
+En `sim7600_scooter_update_loop`, dentro del `while(1)`:
 
 ```text
-1. update_count++
+1. Si no estamos en RUNNING → ejecutar recovery + backoff (connectivity.c)
 
-2. Si connectivity != RUNNING:
-   → connectivity_step_recovery(server_ip, server_port)
-   → connectivity_wait_backoff()
-   → continue
+2. Cada N ciclos: health-check AT + verificar estado de red
 
-3. Health-check cada CONNECTIVITY_NET_CHECK_CYCLES (10) ciclos:
-   - AT → si TIMEOUT → connectivity_notify_at_timeout()
-         → si OK → connectivity_notify_at_ok()
-   - Si ya no es RUNNING → continue
-   - AT+NETOPEN? → si "+NETOPEN: 0" → connectivity_notify_send_failed(true)
-   - Si ya no es RUNNING → continue
+3. PRIORIDAD 1 — Drenar RX:
+   - Tomar uart_mutex
+   - Polling: sim7600_get_rx_buffer_length(0)
+   - Si hay datos: STATE_RX_DRAIN → drain_rx_buffer → STATE_RUN_IDLE
+   - Liberar uart_mutex
 
-4. PRIORIDAD 1 — Drenar RX:
-   - xSemaphoreTake(uart_mutex)
-   - rest = sim7600_get_rx_buffer_length(0)
-   - Si rest > 0:
-     - current_state = STATE_RX_DRAIN
-     - sim7600_drain_rx_buffer(0)
-     - rx_pending[0] = false
-     - current_state = STATE_RUN_IDLE
-   - Si rx_pending[0] pero rest==0: limpiar flag
-   - xSemaphoreGive(uart_mutex)
+4. PRIORIDAD 2 — Enviar telemetria (si !rx_pending[0]):
+   - gps_update()                          → obtener fix GPS
+   - gps_get_position()                    → lat, lon, speed (ultimo valido)
+   - periph_get_bms_power()                → SoC, voltaje (ultimo valido)
+   - STATE_TX_PREPARE
+   - sim7600_send_scooter_update(...)      → JSON con datos reales
+   - STATE_RUN_IDLE
+   - Si falla: detectar si es error de red o socket, transicionar estado
 
-5. PRIORIDAD 3 — Enviar telemetría (si !rx_pending[0]):
-   - Alternar ubicación (locations[0] o locations[1])
-   - current_state = STATE_TX_PREPARE
-   - sim7600_send_scooter_update(0, ...)
-   - current_state = STATE_RUN_IDLE
-   - Si falla: AT+NETOPEN? → decidir si NET_DOWN o SOCKET_DOWN
-     → connectivity_notify_send_failed(network_error)
-
-6. Espera (UPDATE_INTERVAL_SEC * 1000 ms):
-   - Despertar cada RX_POLL_MS (150 ms)
-   - Si rx_pending[0] → break (drenar primero)
+5. Espera UPDATE_INTERVAL_SEC en chunks de RX_POLL_MS; si rx_pending break.
 ```
 
 ---
 
-## 6. Mutex UART — quién toma y quién asume tomado
+## 9. Flujo de comandos lock/unlock
 
-| Función | Mutex |
+```text
+Backend → TCP {"command":"unlock",...} → ESP32
+  → sim7600_drain_rx_buffer() parsea NDJSON
+  → sim7600_process_server_command() extrae campos, dedup por request_id
+  → xQueueSend(command_queue, cmd_item)
+  → sim7600_command_processor_task():
+      → periph_send_unlock()  ← UART1 frame binario a actuadores
+      → sim7600_send_ack()    ← TCP NDJSON al backend
+```
+
+---
+
+## 10. Principio "ultimo valor conocido"
+
+- **GPS sin fix** → envia ultima posicion valida (lat/lon 0 si nunca hubo fix)
+- **BMS sin respuesta** → envia ultimo SoC recibido (0 si nunca llego)
+- **Lock state desconocido** → reporta "unknown" hasta recibir confirmacion del actuador
+
+---
+
+## 11. Mutex UART — quien toma y quien asume tomado
+
+| Funcion | Mutex |
 |---------|-------|
-| `sim7600_send_command()` | **Toma** al entrar, **libera** en todos los return |
-| `sim7600_wait_for_response()` | **No toma**; asume llamador tiene mutex |
-| `sim7600_get_rx_buffer_length()` | **No toma**; asume llamador tiene mutex |
-| `sim7600_read_rx_buffer()` | **No toma**; asume llamador tiene mutex |
-| `sim7600_drain_rx_buffer()` | **No toma**; asume llamador tiene mutex |
-| `sim7600_cipsend()` | **Toma** al entrar, **libera** en todos los return |
-| `sim7600_async_read_task` | Toma con timeout 50 ms, libera inmediatamente |
-
-**NOTA:** `sim7600_netopen()`, `sim7600_cipopen_tcp()`, `sim7600_cipclose()` escriben al UART directamente y llaman a `sim7600_wait_for_response()` **sin tomar el mutex**. Esto es un riesgo potencial (ver sección de bugs).
-
----
-
-## 7. Tareas FreeRTOS
-
-| Tarea | Prioridad | Stack | Función |
-|-------|-----------|-------|---------|
-| `app_main` (implícita) | — | — | Init + loop principal (nunca retorna) |
-| `sim7600_async_read_task` | 5 | 4096 | Detectar URCs (+CIPRXGET, +IPCLOSE, +CIPERROR) |
-| `sim7600_command_processor_task` | 4 | 4096 | Procesar cola de comandos, enviar ACKs |
+| sim7600_send_command() | Toma al entrar, libera en todos los return |
+| sim7600_wait_for_response() | NO toma; asume que el llamador ya tiene mutex |
+| sim7600_get_rx_buffer_length() | NO toma; asume mutex tomado |
+| sim7600_read_rx_buffer() | NO toma; mismo criterio |
+| sim7600_drain_rx_buffer() | Toma al inicio, libera en todos los return |
+| sim7600_cipsend() | Toma al inicio, libera al devolver |
+| sim7600_async_read_task | Toma con timeout corto (50ms), solo detecta URCs |
+| periph_uart (UART1) | Independiente, su propio s_data_mutex para datos BMS/lock |
 
 ---
 
-## 8. Variables globales/estáticas clave (sim7600.c)
+## 12. Telemetria enviada (JSON)
 
-| Variable | Tipo | Uso |
-|----------|------|-----|
-| `uart_mutex` | SemaphoreHandle_t | Proteger UART |
-| `shared_response_buffer[BUF_SIZE]` | char | Buffer compartido para respuestas AT |
-| `shared_data_buffer[BUF_SIZE]` | uint8_t | Buffer compartido para datos |
-| `current_state` | boot_state_t | Estado del loop (RUN_IDLE/RX_DRAIN/TX_PREPARE) |
-| `rx_pending[MAX_LINKS]` | bool | Flag de datos pendientes por link |
-| `rest_len[MAX_LINKS]` | int | Bytes restantes por link |
-| `buffer_mode_active` | bool | Si modo buffer está activo |
-| `locations[2]` | location_t | Coordenadas fijas (Concepción, Chile) |
-| `command_queue` | QueueHandle_t | Cola de comandos del servidor |
-| `static_cmd_item` | command_queue_item_t | Buffer estático para encolar comandos |
-| `server_command_buffer[512]` | char | Buffer para JSON del servidor |
-| `processed_request_ids[20][64]` | char | Cache circular de deduplicación |
-| `server_messages_received` | int | Contador de mensajes recibidos |
-| `async_read_active` | bool | Control de tarea async |
-| `command_processor_active` | bool | Control de tarea procesadora |
-
----
-
-## 9. Constantes y configuración (app_config.h)
-
-| Constante | Valor | Uso |
-|-----------|-------|-----|
-| `UART_SIM` | UART_NUM_2 | Puerto UART del SIM7600 |
-| `UART_TX` / `UART_RX` | GPIO 17 / 16 | Pines UART |
-| `BUF_SIZE` | 1024 | Tamaño de buffers |
-| `RESPONSE_TIMEOUT_MS` | 5000 | Timeout respuestas AT |
-| `MAX_LINKS` | 10 | Máximo de conexiones simultáneas |
-| `SCOOTER_ID` | 1 | ID del scooter |
-| `SCOOTER_BATTERY` | 85 | Nivel batería (fijo) |
-| `SCOOTER_SPEED_KMH` | 15.5f | Velocidad (fija) |
-| `UPDATE_INTERVAL_SEC` | 5 | Intervalo de telemetría |
-| `RX_POLL_MS` | 150 | Polling de datos RX |
-| `SCOOTER_TCP_HOST` | "98.92.176.224" | IP del servidor |
-| `SCOOTER_TCP_PORT` | 8201 | Puerto del servidor |
-| `CONNECTIVITY_AT_RETRY_MS` | 30000 | T1: retry AT (módulo offline) |
-| `CONNECTIVITY_NET_RETRY_MS` | 30000 | T2: retry NETOPEN |
-| `CONNECTIVITY_SOCKET_BACKOFF_LEN` | 5 | Pasos backoff socket |
-| `CONNECTIVITY_AT_TIMEOUT_COUNT` | 3 | Timeouts AT → MODULE_OFFLINE |
-| `CONNECTIVITY_NET_CHECK_CYCLES` | 10 | Cada N ciclos, health-check |
-| `COMMAND_QUEUE_SIZE` | 20 | Tamaño cola de comandos |
-| `MAX_PROCESSED_REQUESTS` | 20 | Dedup request_id |
-| `PENDING_ACK_QUEUE_SIZE` | 10 | Obsoleto |
-
----
-
-## 10. Formatos de mensajes
-
-**Telemetría (JSON, una línea):**
 ```json
-{"scooter_id":1,"latitude":-36.820100,"longitude":-73.044400,"battery_level":85,"speed_kmh":15.5}
+{"scooter_id":1,"latitude":-36.886767,"longitude":-73.044400,"battery_level":50,"speed_kmh":15.3,"lock_state":"locked","voltage":39.11}
 ```
+
+- latitude/longitude: GPS real via AT+CGPSINFO
+- battery_level: SoC% del BMS via UART1
+- speed_kmh: GPS (nudos → km/h)
+- lock_state: "locked" | "unlocked" | "unknown" (actuador via UART1)
+- voltage: voltaje banco BMS
 
 **ACK (NDJSON):**
 ```json
-{"id":"<command_id>","type":"ack","status":"ok","command":"unlock","original_timestamp":"<ts>","client_id":"<cid>","request_id":"<rid>"}
-```
-
-**Comando del servidor (JSON):**
-```json
-{"id":"c-xxx","command":"unlock","timestamp":"...","client_id":"...","request_id":"..."}
+{"id":"<cmd_id>","type":"ack","status":"ok","command":"unlock","original_timestamp":"<ts>","client_id":"...","request_id":"..."}
 ```
 
 ---
 
-## 11. Comandos útiles
+## 13. Configuracion de red (APN)
+
+- **APN:** `m2m.entel.cl` (Entel Chile M2M Manager)
+- **Autenticacion:** PAP con usuario `entelpcs` y clave `entelpcs`
+- **Secuencia:** `AT+CGDCONT=1,"IP","m2m.entel.cl"` → `AT+CGAUTH=1,1,"entelpcs","entelpcs"`
+- **Servidor TCP:** `98.92.176.224:8201`
+- **DNS:** `8.8.8.8`, `8.8.4.4`
+
+---
+
+## 14. Secuencia de inicializacion
+
+**app_main (main.c):**
+1. Init UART2 (SIM7600): 115200, 8N1
+2. Init UART1 (electronica): periph_uart_init() → tarea RX en background
+3. Solicitar BMS SoC periodico (cada 1s) y status (cada 10s)
+4. Test AT con SIM7600
+5. Iniciar GPS: AT+CGPS=1,1 (lo antes posible para TTFF)
+6. Configurar PDP: AT+CGDCONT + AT+CGAUTH (APN M2M con PAP)
+7. Leer configuracion PDP
+8. Lanzar sim7600_scooter_update_loop() (no retorna)
+
+**sim7600_scooter_update_loop (setup antes del while):**
+1. connectivity_init()
+2. Crear uart_mutex
+3. AT+CIPMODE=0 (no transparente)
+4. AT+CIPRXGET=1 (modo buffer)
+5. AT+NETOPEN
+6. AT+CIPDNSSET
+7. AT+CIPOPEN=0,"TCP",host,port
+8. Crear command_queue
+9. Lanzar command_processor_task (prioridad 4)
+10. Lanzar async_read_task (prioridad 5)
+11. connectivity_set_state(RUNNING)
+12. while(1) → loop principal
+
+---
+
+## 15. Constantes clave (app_config.h)
+
+| Constante | Valor |
+|-----------|-------|
+| UART_SIM | UART_NUM_2 |
+| UART_TX / UART_RX | GPIO17 / GPIO16 |
+| PERIPH_TX_PIN / RX_PIN | GPIO4 / GPIO5 |
+| SCOOTER_ID | 1 |
+| UPDATE_INTERVAL_SEC | 5 |
+| RX_POLL_MS | 150 |
+| BUF_SIZE | 1024 |
+| RESPONSE_TIMEOUT_MS | 5000 |
+| APN_NAME | "m2m.entel.cl" |
+| APN_USER / APN_PASS | "entelpcs" / "entelpcs" |
+| SCOOTER_TCP_HOST | "98.92.176.224" |
+| SCOOTER_TCP_PORT | 8201 |
+| BMS_SOC_POLL_PERIOD_SEC | 1 |
+| BMS_STATUS_POLL_PERIOD_SEC | 10 |
+| COMMAND_QUEUE_SIZE | 20 |
+| MAX_PROCESSED_REQUESTS | 20 |
+
+---
+
+## 16. Comandos utiles
 
 - **Compilar:** `pio run`
-- **Flashear:** `pio run --target upload` (opcional `--upload-port /dev/ttyACM0`).
-- **Monitor serial:** `pio device monitor -p /dev/ttyACM0 -b 115200`.
+- **Flashear:** `pio run --target upload` (opcional `--upload-port /dev/ttyACM0`)
+- **Monitor serial:** `pio device monitor -p /dev/ttyACM0 -b 115200`
 
 ---
 
-## 12. Estado actual y próximos pasos
+## 17. Estado actual
 
-- **Separación parcial completada:** sim7600.c, connectivity.c, app_config.h, main.c.
-- **Pendiente:** Extraer `server_cmd.c/.h` (procesamiento de comandos sigue en sim7600.c).
-- **Pendiente:** Implementar reset hardware PWRKEY del SIM7600.
-- **Pendiente:** Limpiar código obsoleto (pending_ack_item_t, estados boot_state_t no usados).
-- **Pendiente:** Proteger secuencias UART sin mutex en netopen/cipopen_tcp/cipclose.
-- **Próximo paso conocido:** Integrar BMS por UART (UART1 en GPIOs libres).
-
----
-
-*Documento generado a partir del código fuente real (2026-03-16). Incluye máquina de estados, flujo del loop, reglas de mutex, variables, constantes y formatos.*
+- GPS real implementado (AT+CGPSINFO), reemplaza coordenadas hardcodeadas
+- BMS via UART1 con protocolo binario de frames (Fletcher-16)
+- Lock/unlock se reenvian a actuadores via UART1
+- Telemetria incluye lock_state y voltage
+- APN actualizado a m2m.entel.cl con autenticacion PAP
+- Principio "ultimo valor conocido" para GPS y BMS
+- Build exitoso: RAM 5.3%, Flash 25.8%

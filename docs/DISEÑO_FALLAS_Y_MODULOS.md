@@ -1,167 +1,153 @@
-# Diseño: control de fallas y separación en módulos
-
-Documento actualizado (2026-03-16) que refleja el estado real de la implementación y marca qué está hecho, qué falta, y qué bugs se han identificado.
+# Diseno: control de fallas y separacion en modulos
 
 ---
 
-## Parte 1 — Control de fallas (IMPLEMENTADO)
+## Parte 1 — Control de fallas (estados y flujo)
 
 ### 1.1 Capas de conectividad
 
 | Capa | Significado | Si falla |
 |------|-------------|----------|
-| **Módulo** | SIM7600 responde por UART (AT OK) | Reintentar AT cada T1; si OK → setup completo |
-| **Red** | PDP/red abierta (NETOPEN) | Reintentar NETOPEN cada T2; no tocar CIPOPEN hasta que red esté OK |
-| **Socket** | Conexión TCP al backend (CIPOPEN link 0) | Solo reintentar CIPOPEN con backoff; no tocar NETOPEN |
+| **Modulo** | SIM7600 responde por UART (AT OK) | Reintentar AT; cuando responda, ejecutar setup completo (idempotente) |
+| **Red** | PDP/red abierta (NETOPEN) | Reintentar NETOPEN; no rehacer CIPOPEN hasta que red este OK |
+| **Socket** | Conexion TCP al backend (CIPOPEN link 0) | Solo reintentar CIPOPEN; no tocar NETOPEN ni setup del modulo |
 
-### 1.2 Estados (implementados en connectivity.c)
+### 1.2 Maquina de estados de conectividad
+
+Implementada en `connectivity.h / connectivity.c`:
 
 ```c
 typedef enum {
-    CONNECTIVITY_MODULE_OFFLINE,   // Módulo no responde. Reintentar AT cada T1 (30s).
-    CONNECTIVITY_MODULE_READY,     // AT OK; ejecutar setup completo.
-    CONNECTIVITY_NET_DOWN,         // Red no abierta. Reintentar NETOPEN cada T2 (30s).
+    CONNECTIVITY_MODULE_OFFLINE,   // Modulo no responde por UART. Reintentar AT cada 30s.
+    CONNECTIVITY_MODULE_READY,     // AT OK; falta configurar red/socket.
+    CONNECTIVITY_NET_DOWN,         // Red no abierta. Reintentar NETOPEN cada 30s.
     CONNECTIVITY_NET_READY,        // Red abierta; falta socket.
-    CONNECTIVITY_SOCKET_DOWN,      // Socket caído. Reintentar CIPOPEN con backoff.
-    CONNECTIVITY_RUNNING           // Todo OK; loop normal.
+    CONNECTIVITY_SOCKET_DOWN,      // Socket cerrado. Reintentar CIPOPEN con backoff.
+    CONNECTIVITY_RUNNING           // Red + socket OK; loop normal.
 } connectivity_state_t;
 ```
 
-### 1.3 Transiciones (implementadas)
+### 1.3 Transiciones
 
 ```text
-RUNNING → send falla + red cerrada    → NET_DOWN
-RUNNING → send falla + red OK         → SOCKET_DOWN
-RUNNING → N timeouts AT (health-check) → MODULE_OFFLINE
-
-MODULE_OFFLINE → AT OK        → MODULE_READY → run_full_setup()
-                                  → Si NETOPEN falla  → NET_DOWN
-                                  → Si CIPOPEN falla  → SOCKET_DOWN
-                                  → Si todo OK        → RUNNING
-
-NET_DOWN → NETOPEN OK         → NET_READY → intenta CIPOPEN
-                                  → Si OK    → RUNNING
-                                  → Si falla → SOCKET_DOWN
-
-NET_READY → CIPOPEN OK        → RUNNING
-NET_READY → CIPOPEN falla     → SOCKET_DOWN
-
-SOCKET_DOWN → CIPOPEN OK      → RUNNING
-SOCKET_DOWN → CIPOPEN falla   → queda en SOCKET_DOWN (con backoff)
+RUNNING → CIPSEND falla (+CIPERROR/+IPCLOSE) → SOCKET_DOWN
+RUNNING → NETOPEN? indica red cerrada → NET_DOWN
+RUNNING → N timeouts AT seguidos → MODULE_OFFLINE
+MODULE_OFFLINE → AT OK → MODULE_READY → setup completo → RUNNING (o NET_DOWN/SOCKET_DOWN)
+NET_DOWN → NETOPEN OK → NET_READY → CIPOPEN → RUNNING
+SOCKET_DOWN → CIPOPEN OK → RUNNING
 ```
 
-### 1.4 Detección (implementada en sim7600_scooter_update_loop)
+### 1.4 Deteccion
 
-| Qué detectar | Cómo se detecta | Código |
-|--------------|-----------------|--------|
-| Módulo no responde | Health-check AT cada 10 ciclos; 3 timeouts seguidos → MODULE_OFFLINE | `connectivity_notify_at_timeout()` |
-| Red cerrada | `AT+NETOPEN?` devuelve `+NETOPEN: 0` durante health-check o tras fallo de envío | `connectivity_notify_send_failed(true)` |
-| Socket caído | `sim7600_send_scooter_update` falla + red sigue abierta | `connectivity_notify_send_failed(false)` |
+| Que detectar | Donde / como |
+|--------------|--------------|
+| Modulo no responde | Cada CONNECTIVITY_NET_CHECK_CYCLES (10) ciclos: AT health-check. N timeouts → MODULE_OFFLINE |
+| Red cerrada | sim7600_netopen_status() tras fallo de envio; si "+NETOPEN: 0" → NET_DOWN |
+| Socket cerrado | +IPCLOSE/+CIPERROR en async_read_task; fallo de cipsend → SOCKET_DOWN |
 
-### 1.5 Backoff (implementado en connectivity.c)
+### 1.5 Recuperacion (connectivity_step_recovery)
 
-| Estado | Espera |
+| Estado | Accion |
 |--------|--------|
-| MODULE_OFFLINE | T1 = 30s fijo |
-| NET_DOWN | T2 = 30s fijo |
-| SOCKET_DOWN | Exponencial: 10s → 30s → 60s → 120s → 300s (tope) |
-| RUNNING | 1s (default, no aplica) |
+| MODULE_OFFLINE | Enviar AT; si OK → MODULE_READY → run_full_setup() |
+| MODULE_READY | Setup idempotente: CIPMODE(0), buffer(1), NETOPEN, DNS, CIPOPEN |
+| NET_DOWN | Reintentar NETOPEN; si OK → NET_READY → intentar CIPOPEN |
+| NET_READY | Intentar CIPOPEN |
+| SOCKET_DOWN | Solo CIPOPEN (con backoff exponencial) |
+| RUNNING | Nada; el loop hace drain/send |
 
-Tras reconexión exitosa (→ RUNNING), el índice de backoff se resetea a 0.
+### 1.6 Backoff (connectivity_wait_backoff)
 
-### 1.6 Setup completo (run_full_setup en connectivity.c)
+| Estado | Intervalo |
+|--------|-----------|
+| MODULE_OFFLINE | 30s fijo (CONNECTIVITY_AT_RETRY_MS) |
+| NET_DOWN | 30s fijo (CONNECTIVITY_NET_RETRY_MS) |
+| SOCKET_DOWN | Exponencial: 10s → 30s → 1min → 2min → 5min (tope). Se resetea a 0 tras exito. |
 
-Secuencia idempotente ejecutada desde MODULE_READY:
-1. `sim7600_set_cipmode(0)` — no transparente
-2. `sim7600_set_buffer_mode(1)` — modo buffer
-3. `sim7600_netopen()` — si falla → NET_DOWN, return
-4. `sim7600_set_dns("8.8.8.8", "8.8.4.4")`
-5. `sim7600_cipclose(0)` — limpiar link si estaba abierto
-6. `sim7600_cipopen_tcp(0, server_ip, server_port)` — si falla → SOCKET_DOWN
+### 1.7 (Opcional) Reset hardware del SIM7600
 
-### 1.7 Reset hardware PWRKEY (NO implementado)
-
-Diseño original contemplaba reset por GPIO tras K intentos fallidos en MODULE_OFFLINE. Requiere definir `SIM7600_PWRKEY_GPIO` en app_config.h y función `sim7600_hardware_reset()`.
-
----
-
-## Parte 2 — Separación del código
-
-### 2.1 Estado actual de la separación
-
-| Archivo | Estado | Contenido |
-|---------|--------|-----------|
-| **app_config.h** | ✅ Implementado | Defines UART, pines, constantes scooter, servidor, backoff, colas, `location_t` |
-| **sim7600.h** | ✅ Implementado | `sim7600_response_t`, `boot_state_t`, todos los prototipos públicos |
-| **sim7600.c** | ✅ Implementado | Driver AT completo + procesamiento de comandos + loop principal |
-| **connectivity.h** | ✅ Implementado | `connectivity_state_t`, prototipos de recuperación |
-| **connectivity.c** | ✅ Implementado | Máquina de estados, backoff, `run_full_setup`, `connectivity_step_recovery` |
-| **main.c** | ✅ Implementado | `app_main`: init UART, AT test, PDP, arranca loop |
-| **server_cmd.h/.c** | ❌ Pendiente | Procesamiento de comandos sigue dentro de sim7600.c |
-
-### 2.2 Qué falta extraer de sim7600.c a server_cmd.c
-
-- `command_queue_item_t` (typedef struct)
-- `command_queue`, `static_cmd_item`, `server_command_buffer`
-- `processed_request_ids[][]`, `processed_request_count`, `processed_request_index`
-- `server_messages_received`
-- `sim7600_process_server_command()`
-- `sim7600_command_processor_task()`
-- `sim7600_send_ack()`
-- Macro `EXTRACT_JSON_FIELD`
-
-Dependencias: server_cmd necesitaría llamar a `sim7600_cipsend()` para enviar ACKs.
-
-### 2.3 Código obsoleto pendiente de eliminar
-
-- `pending_ack_item_t` (struct)
-- `pending_ack_queue` (QueueHandle_t, marcado `__attribute__((unused))`)
-- `static_acks_buffer[PENDING_ACK_QUEUE_SIZE]` (marcado unused)
-- `static_ack_obj_buffer[256]` (marcado unused)
-- Estados no usados de `boot_state_t`: STATE_BOOT, STATE_NET_UP, STATE_SOCKET_CONNECTING, STATE_TX_WAIT_PROMPT, STATE_TX_SENDING, STATE_TX_WAIT_RESULT, STATE_ERROR_RECOVER
+Si el modulo deja de responder tras muchos intentos en MODULE_OFFLINE:
+- Pin PWRKEY del SIM7600: pulso low 1.5s → high → esperar 10-15s → reintentar AT.
+- Requiere definir `SIM7600_PWRKEY_GPIO` en app_config.h.
 
 ---
 
-## Parte 3 — Bugs identificados y mejoras propuestas
+## Parte 2 — Separacion en modulos (implementada)
 
-### 3.1 Bugs
+### 2.1 Estructura actual
 
-**BUG-1: Secuencias UART sin protección de mutex (MEDIO-ALTO)**
-Las funciones `sim7600_netopen()`, `sim7600_cipopen_tcp()`, `sim7600_cipclose()` y `sim7600_cipopen_tcp_transparent()` escriben directamente al UART con `uart_write_bytes()` y luego llaman a `sim7600_wait_for_response()` **sin tomar el mutex**. La tarea `sim7600_async_read_task` podría consumir la respuesta antes de que `wait_for_response` la lea.
+```text
+src/
+  main.c              — app_main: init UARTs, GPS, BMS, PDP, lanza update loop
+  app_config.h         — Todos los defines centralizados
+  sim7600.h/.c         — Driver SIM7600: AT, TCP, buffer mode, telemetria, comandos, ACK
+  gps.h/.c             — GPS via AT+CGPSINFO (ultimo fix valido)
+  frame_protocol.h/.c  — Protocolo binario: parser incremental, builder, Fletcher-16
+  periph_uart.h/.c     — UART1: BMS (SoC, voltaje, proteccion) + actuadores (lock/unlock)
+  connectivity.h/.c    — Maquina de estados de conectividad + backoff
+```
 
-Archivos: sim7600.c líneas ~503, ~1029-1033, ~1064-1068, ~939.
-Fix: Estas funciones deben tomar `uart_mutex` antes de escribir y liberarlo después de `wait_for_response`.
+### 2.2 Responsabilidades
 
-**BUG-2: uart_flush_input descarta URCs (MEDIO)**
-Las funciones `sim7600_netopen()`, `sim7600_cipopen_tcp()`, `sim7600_cipclose()`, `sim7600_cipopen_tcp_transparent()` llaman a `uart_flush_input(UART_SIM)` antes de escribir comandos. Esto puede descartar URCs `+CIPRXGET: 1,<link>` que estaban pendientes, causando pérdida de datos del servidor.
+| Archivo | Responsabilidad | Depende de |
+|---------|----------------|------------|
+| main.c | Orquestacion: init, config, lanzar loop | Todos |
+| sim7600.c | Todo lo AT: envio TCP, recepcion, drain, cipsend, telemetria | app_config, gps, periph_uart, connectivity |
+| gps.c | Obtener posicion GPS real del SIM7600 | sim7600 (send_command), app_config |
+| frame_protocol.c | Parsear/construir frames binarios | Ninguno (standalone) |
+| periph_uart.c | Comunicacion UART1 con electronica | frame_protocol, app_config |
+| connectivity.c | Recovery de red con backoff | sim7600, app_config |
 
-Fix: Eliminar `uart_flush_input()` o reemplazarla por una lectura que parsee URCs antes de descartarlos.
+### 2.3 Variables: donde viven
 
-**BUG-3: Race condition en rx_pending (BAJO)**
-`rx_pending[]` es modificado por `sim7600_async_read_task` (pone true) y por el loop principal (pone false) sin protección atómica formal. En ESP32 (32-bit) un bool es atómico en la práctica, pero no es portable ni formalmente correcto.
+| Variable / estado | Archivo |
+|-------------------|---------|
+| Pines, UARTs, timeouts, host, port, APN | app_config.h (defines) |
+| uart_mutex, shared_buffers, rx_pending, current_state | sim7600.c (static) |
+| command_queue, static_cmd_item, dedup cache | sim7600.c (static) |
+| s_last_pos (GPS) | gps.c (static) |
+| s_bms_power, s_bms_status, s_lock_state | periph_uart.c (static, protegido por s_data_mutex) |
+| s_state, s_socket_backoff_index, s_at_timeout_count | connectivity.c (static) |
 
-Fix: Usar `atomic_bool` de `<stdatomic.h>` o proteger con mutex/spinlock.
+### 2.4 Flujo de datos entre modulos
 
-### 3.2 Mejoras propuestas
+```text
+                    ┌─────────────────┐
+                    │    main.c       │
+                    │  (orquestacion) │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+         UART0 (USB)    UART2 (SIM7600)  UART1 (Electronica)
+         Debug logs     sim7600.c        periph_uart.c
+                        gps.c            frame_protocol.c
+                        connectivity.c
+                             │              │
+                    ┌────────┴────────┐     │
+                    │                 │     │
+               TCP socket        GPS        │
+               Telemetria +      Real       │
+               Cmds server                  │
+                                    ┌───────┴────────┐
+                                    │  Protocolo     │
+                                    │  binario       │
+                                    └───────┬────────┘
+                                            │
+                              ┌─────────────┼──────────┐
+                              │             │          │
+                         BMS (0x01)   Actuadores   Sistema
+                         SoC, V, A    Lock/Unlock   KeepAlive
+                         Temp, Prot   (0x03)       (0xFF)
+```
 
-**MEJORA-1: Extraer server_cmd.c/.h**
-Mover todo el procesamiento de comandos fuera de sim7600.c. Reduce sim7600.c de 2175 a ~1700 líneas y mejora separación de responsabilidades.
+### 2.5 Principio "ultimo valor conocido"
 
-**MEJORA-2: Limpiar boot_state_t**
-Solo se usan 3 de 10 estados. Reducir el enum a los 3 usados o implementar los restantes.
+Todos los modulos de datos (gps.c, periph_uart.c) mantienen internamente el ultimo valor valido recibido. Si una lectura falla o no hay datos nuevos, los getters retornan el valor anterior. Esto garantiza que la telemetria siempre tiene datos, aunque no sean frescos.
 
-**MEJORA-3: Eliminar código obsoleto**
-Quitar `pending_ack_item_t`, `pending_ack_queue`, y buffers asociados (~20 líneas de código muerto).
-
-**MEJORA-4: Parseo JSON más robusto**
-`EXTRACT_JSON_FIELD` es una macro con parseo manual por `strchr`. No maneja: valores numéricos (busca comillas), strings con escape (`\"`), objetos anidados. Considerar cJSON (disponible en ESP-IDF) para parseo seguro.
-
-**MEJORA-5: Reset hardware PWRKEY**
-Implementar `sim7600_hardware_reset()` para recuperar de cuelgues del módulo que no responden a AT.
-
-**MEJORA-6: Telemetría con datos reales**
-Actualmente usa coordenadas fijas (Concepción, Chile), batería fija (85%), velocidad fija (15.5 km/h). Preparar para integración con GPS real y BMS.
-
----
-
-*Documento actualizado a partir del código fuente real (2026-03-16).*
+| Modulo | Getter | Si no hay datos |
+|--------|--------|-----------------|
+| GPS | gps_get_position() | valid=false, lat/lon=0 |
+| BMS | periph_get_bms_power() | valid=false, soc=0 |
+| Actuador | periph_get_lock_state() | LOCK_STATE_UNKNOWN → "unknown" |

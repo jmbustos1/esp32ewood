@@ -53,6 +53,9 @@ sim7600_response_t sim7600_set_pdp_context(int cid, const char *pdp_type, const 
                                           const char *pdp_addr, int d_comp, int h_comp);
 sim7600_response_t sim7600_read_pdp_context(char *response, size_t response_size);
 sim7600_response_t sim7600_test_pdp_context(char *response, size_t response_size);
+sim7600_response_t sim7600_set_auth(int cid, int auth_type, const char *user, const char *password);
+/** Verifica registro en red celular (AT+CREG?). Retorna 1 si registrado (home o roaming), 0 si no. */
+int sim7600_is_registered(void);
 sim7600_response_t sim7600_set_cipmode(int mode);
 sim7600_response_t sim7600_read_cipmode(char *response, size_t response_size);
 sim7600_response_t sim7600_netopen(void);

@@ -44,10 +44,37 @@ static void run_full_setup(const char *server_ip, int server_port)
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
 
+    /* Re-configurar PDP + autenticacion PAP.
+     * Necesario cuando el SIM7600 se reseteo internamente o la red
+     * cerro el PDP context (sin datos, inactividad larga). */
+    ESP_LOGI(TAG, "[Setup] PDP context (APN=%s)...", APN_NAME);
+    r = sim7600_set_pdp_context(1, "IP", APN_NAME, NULL, 0, 0);
+    if (r != SIM7600_OK) {
+        ESP_LOGW(TAG, "[Setup] PDP context no OK, continuando");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "[Setup] Autenticacion PAP...");
+    r = sim7600_set_auth(1, 1, APN_USER, APN_PASS);
+    if (r != SIM7600_OK) {
+        ESP_LOGW(TAG, "[Setup] Auth PAP no OK, continuando");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    /* Esperar registro celular antes de abrir red.
+     * Si no hay senal (tunel, sin datos), no tiene sentido intentar NETOPEN. */
+    ESP_LOGI(TAG, "[Setup] Verificando registro celular...");
+    if (!sim7600_is_registered()) {
+        ESP_LOGW(TAG, "[Setup] Sin registro celular → NET_DOWN (esperando senal)");
+        s_state = CONNECTIVITY_NET_DOWN;
+        return;
+    }
+    ESP_LOGI(TAG, "[Setup] Registro celular OK");
+
     ESP_LOGI(TAG, "[Setup] NETOPEN...");
     r = sim7600_netopen();
     if (r != SIM7600_OK) {
-        ESP_LOGE(TAG, "[Setup] NETOPEN falló → NET_DOWN");
+        ESP_LOGE(TAG, "[Setup] NETOPEN fallo → NET_DOWN");
         s_state = CONNECTIVITY_NET_DOWN;
         return;
     }
@@ -119,19 +146,41 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
         break;
 
     case CONNECTIVITY_NET_DOWN:
+        /* Verificar registro celular antes de intentar NETOPEN.
+         * Cubre: sin senal (tunel), SIM sin datos (recarga pendiente). */
+        if (!sim7600_is_registered()) {
+            ESP_LOGW(TAG, "Sin registro celular, no intentar NETOPEN");
+            return;
+        }
+
+        /* Re-configurar PDP + PAP por si se perdio (recarga de datos, reset interno) */
+        sim7600_set_pdp_context(1, "IP", APN_NAME, NULL, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        sim7600_set_auth(1, 1, APN_USER, APN_PASS);
+        vTaskDelay(pdMS_TO_TICKS(300));
+
         ESP_LOGI(TAG, "Reintento NETOPEN...");
         r = sim7600_netopen();
+        if (r == SIM7600_TIMEOUT) {
+            connectivity_notify_at_timeout();
+        }
         if (r != SIM7600_OK) {
-            ESP_LOGW(TAG, "NETOPEN falló, seguir en NET_DOWN");
+            ESP_LOGW(TAG, "NETOPEN fallo, seguir en NET_DOWN");
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(3000));
         s_state = CONNECTIVITY_NET_READY;
         ESP_LOGI(TAG, "NETOPEN OK → NET_READY");
         /* Intentar CIPOPEN en el mismo paso */
-        sim7600_cipclose(0);
+        r = sim7600_cipclose(0);
+        if (r == SIM7600_TIMEOUT) {
+            connectivity_notify_at_timeout();
+        }
         vTaskDelay(pdMS_TO_TICKS(500));
         r = sim7600_cipopen_tcp(0, server_ip, server_port);
+        if (r == SIM7600_TIMEOUT) {
+            connectivity_notify_at_timeout();
+        }
         if (r == SIM7600_OK) {
             s_state = CONNECTIVITY_RUNNING;
             s_socket_backoff_index = 0;
@@ -143,10 +192,16 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
         }
         break;
 
-    case CONNECTIVITY_NET_READY:
-        sim7600_cipclose(0);
+    case CONNECTIVITY_NET_READY: {
+        r = sim7600_cipclose(0);
+        if (r == SIM7600_TIMEOUT) {
+            connectivity_notify_at_timeout();
+        }
         vTaskDelay(pdMS_TO_TICKS(500));
         r = sim7600_cipopen_tcp(0, server_ip, server_port);
+        if (r == SIM7600_TIMEOUT) {
+            connectivity_notify_at_timeout();
+        }
         if (r == SIM7600_OK) {
             s_state = CONNECTIVITY_RUNNING;
             s_socket_backoff_index = 0;
@@ -157,11 +212,18 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
             ESP_LOGI(TAG, "CIPOPEN falló → SOCKET_DOWN");
         }
         break;
+    }
 
     case CONNECTIVITY_SOCKET_DOWN:
-        sim7600_cipclose(0);
+        r = sim7600_cipclose(0);
+        if (r == SIM7600_TIMEOUT) {
+            connectivity_notify_at_timeout();
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
         r = sim7600_cipopen_tcp(0, server_ip, server_port);
+        if (r == SIM7600_TIMEOUT) {
+            connectivity_notify_at_timeout();
+        }
         if (r == SIM7600_OK) {
             s_state = CONNECTIVITY_RUNNING;
             s_socket_backoff_index = 0;
