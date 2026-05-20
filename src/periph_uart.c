@@ -41,6 +41,24 @@ static SemaphoreHandle_t s_data_mutex = NULL;
 /* Parser de frames */
 static frame_parser_t s_parser;
 
+/* ── Helpers debug ───────────────────────────────────────────────── */
+
+#if FRAME_DEBUG_TX || FRAME_DEBUG_FIELDS
+static void log_hex_dump(const char *prefix, const uint8_t *data, size_t len)
+{
+    char buf[3 * 128 + 1];
+    size_t pos = 0;
+    size_t limit = len < 128 ? len : 128;
+    for (size_t i = 0; i < limit && pos + 4 < sizeof(buf); i++) {
+        int n = snprintf(buf + pos, sizeof(buf) - pos, "%02X ", data[i]);
+        if (n <= 0) break;
+        pos += n;
+    }
+    if (pos > 0 && buf[pos - 1] == ' ') buf[pos - 1] = '\0';
+    ESP_LOGI(TAG, "%s [%zu bytes]: %s%s", prefix, len, buf, len > 128 ? " ...(truncado)" : "");
+}
+#endif
+
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
 static void process_bms_soc(const frame_parsed_t *f)
@@ -51,10 +69,25 @@ static void process_bms_soc(const frame_parsed_t *f)
         return;
     }
 
+#if FRAME_DEBUG_FIELDS
+    log_hex_dump("BMS SoC raw DATA", f->data, f->data_len);
+#endif
+
     uint16_t raw_voltage  = ((uint16_t)f->data[0] << 8) | f->data[1];
     int16_t  raw_current  = (int16_t)(((uint16_t)f->data[2] << 8) | f->data[3]);
     uint16_t raw_capacity = ((uint16_t)f->data[4] << 8) | f->data[5];
     uint8_t  soc          = f->data[6];
+
+#if FRAME_DEBUG_FIELDS
+    ESP_LOGI(TAG, "  data[0..1] Voltage  = 0x%02X%02X (BE)        -> %u * 10mV = %.2f V",
+             f->data[0], f->data[1], raw_voltage, raw_voltage * 0.01f);
+    ESP_LOGI(TAG, "  data[2..3] Current  = 0x%02X%02X (BE signed) -> %d * 10mA = %.2f A",
+             f->data[2], f->data[3], raw_current, raw_current * 0.01f);
+    ESP_LOGI(TAG, "  data[4..5] Capacity = 0x%02X%02X (BE)        -> %u * 10mAh = %.2f Ah",
+             f->data[4], f->data[5], raw_capacity, raw_capacity * 0.01f);
+    ESP_LOGI(TAG, "  data[6]    SoC      = 0x%02X                -> %u %%",
+             f->data[6], soc);
+#endif
 
     xSemaphoreTake(s_data_mutex, portMAX_DELAY);
     s_bms_power.voltage     = raw_voltage * 0.01f;     /* 10mV → V */
@@ -75,6 +108,14 @@ static void process_bms_control_status(const frame_parsed_t *f)
         ESP_LOGW(TAG, "BMS Status: data_len=%u < 7", f->data_len);
         return;
     }
+
+#if FRAME_DEBUG_FIELDS
+    log_hex_dump("BMS Status raw DATA", f->data, f->data_len);
+    ESP_LOGI(TAG, "  data[0]     Control    = 0x%02X (b0=chg, b1=dischg)", f->data[0]);
+    ESP_LOGI(TAG, "  data[1..2]  Protection = 0x%02X%02X", f->data[1], f->data[2]);
+    ESP_LOGI(TAG, "  data[3..6]  Balance    = 0x%02X%02X%02X%02X",
+             f->data[3], f->data[4], f->data[5], f->data[6]);
+#endif
 
     xSemaphoreTake(s_data_mutex, portMAX_DELAY);
     s_bms_status.control_status = f->data[0];
@@ -99,7 +140,20 @@ static void process_actuator_response(const frame_parsed_t *f)
      * Por ahora asumimos que un ANS confirma el ultimo comando enviado.
      * El contenido del MSG dependera de la implementacion del micro actuador.
      * Minimo: MSGID indica lock(0x01) o unlock(0x02) confirmado.
+     *
+     * OJO: segun doc, layout WRITE actuador es: MODULE|SMOD|ACTION|PERIOD.
+     * El parser lo carga como msg_id=SMOD, period=ACTION. Asi que aqui
+     * msg_id=0x01 = SMOD LOCKER, y la accion real esta en f->period
+     * (0xFF=activar/unlock, 0x0F=desactivar/lock segun doc).
      */
+#if FRAME_DEBUG_FIELDS
+    ESP_LOGI(TAG, "Actuador rsp: SMOD(msg_id)=0x%02X ACTION(period)=0x%02X data_len=%u",
+             f->msg_id, f->period, f->data_len);
+    if (f->data_len > 0) {
+        log_hex_dump("  actuator DATA", f->data, f->data_len);
+    }
+#endif
+
     if (f->data_len < 1) return;
 
     lock_state_t new_state = LOCK_STATE_UNKNOWN;
@@ -169,6 +223,10 @@ static void periph_rx_task(void *pvParameters)
         if (len > 0) {
             if (frame_parser_feed(&s_parser, rx_byte)) {
                 frame_parsed_t f = frame_parser_get_result(&s_parser);
+#if FRAME_DEBUG_FIELDS
+                ESP_LOGI(TAG, "=== FRAME COMPLETO: TYPE=0x%02X MODULE=0x%02X MSGID=0x%02X PERIOD=0x%02X data_len=%u ===",
+                         f.type, f.module_id, f.msg_id, f.period, f.data_len);
+#endif
                 process_frame(&f);
             }
         }
@@ -179,6 +237,15 @@ static void periph_rx_task(void *pvParameters)
 
 static int periph_send_frame(const uint8_t *frame, size_t len)
 {
+#if FRAME_DEBUG_TX
+    log_hex_dump("TX frame", frame, len);
+    if (len >= 6) {
+        uint16_t length_field = ((uint16_t)frame[2] << 8) | frame[3];
+        uint16_t chks_field   = ((uint16_t)frame[len - 2] << 8) | frame[len - 1];
+        ESP_LOGI(TAG, "  SOF=%02X%02X LENGTH=0x%04X TYPE=0x%02X CHKS=0x%04X",
+                 frame[0], frame[1], length_field, frame[4], chks_field);
+    }
+#endif
     int written = uart_write_bytes(PERIPH_UART, frame, len);
     if (written < 0 || (size_t)written != len) {
         ESP_LOGE(TAG, "Error enviando frame (%d/%zu)", written, len);

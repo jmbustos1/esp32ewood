@@ -57,6 +57,15 @@
 #define PENDING_ACK_QUEUE_SIZE 10
 
 // ---------------------------------------------------------------------------
+// Debug parser de frames UART1 (electronica/BMS)
+// Apagar (0) en produccion para no inundar el UART debug.
+// ---------------------------------------------------------------------------
+#define FRAME_DEBUG_BYTES        1  /* log byte a byte cuando entra al parser */
+#define FRAME_DEBUG_FIELDS       1  /* log campo a campo al decodificar BMS */
+#define FRAME_DEBUG_TX           1  /* hex dump de frames enviados */
+#define FRAME_ACCEPT_BAD_CHKS    1  /* procesar frame aunque falle checksum (DEBUG ONLY) */
+
+// ---------------------------------------------------------------------------
 // Ubicaciones (Concepción, Chile)
 // ---------------------------------------------------------------------------
 typedef struct {
