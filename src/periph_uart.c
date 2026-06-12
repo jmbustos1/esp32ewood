@@ -32,6 +32,12 @@ static const char *TAG = "PERIPH";
 #define PERIPH_BAUD_RATE  115200
 #define PERIPH_BUF_SIZE   512
 
+/* ── Protocolo MODULE 0x03 (Actuadores) ──────────────────────────── */
+/* Layout WRITE: MODULE|SMOD|ACTION|PERIOD                            */
+#define ACTUATOR_SMOD_LOCKER  0x01  /* SubModule: candado electronico */
+#define ACTUATOR_ACTION_ON    0xFF  /* Activar  (unlock)              */
+#define ACTUATOR_ACTION_OFF   0x0F  /* Desactivar (lock)              */
+
 /* ── Estado interno (ultimo valor conocido) ──────────────────────── */
 static bms_power_t  s_bms_power  = { .valid = false };
 static bms_status_t s_bms_status = { .valid = false };
@@ -137,14 +143,10 @@ static void process_actuator_response(const frame_parsed_t *f)
 {
     /*
      * Respuesta del modulo actuadores (MODULE 0x03).
-     * Por ahora asumimos que un ANS confirma el ultimo comando enviado.
-     * El contenido del MSG dependera de la implementacion del micro actuador.
-     * Minimo: MSGID indica lock(0x01) o unlock(0x02) confirmado.
-     *
-     * OJO: segun doc, layout WRITE actuador es: MODULE|SMOD|ACTION|PERIOD.
-     * El parser lo carga como msg_id=SMOD, period=ACTION. Asi que aqui
-     * msg_id=0x01 = SMOD LOCKER, y la accion real esta en f->period
-     * (0xFF=activar/unlock, 0x0F=desactivar/lock segun doc).
+     * Layout segun doc: MODULE|SMOD|ACTION|PERIOD.
+     * El parser de frame_protocol.c carga posicionalmente:
+     *   f->msg_id  = SMOD   (0x01 = LOCKER)
+     *   f->period  = ACTION (0xFF = activado/unlocked, 0x0F = desactivado/locked)
      */
 #if FRAME_DEBUG_FIELDS
     ESP_LOGI(TAG, "Actuador rsp: SMOD(msg_id)=0x%02X ACTION(period)=0x%02X data_len=%u",
@@ -154,13 +156,14 @@ static void process_actuator_response(const frame_parsed_t *f)
     }
 #endif
 
-    if (f->data_len < 1) return;
+    /* Solo nos interesa el submodulo LOCKER por ahora */
+    if (f->msg_id != ACTUATOR_SMOD_LOCKER) return;
 
     lock_state_t new_state = LOCK_STATE_UNKNOWN;
-    if (f->msg_id == 0x01) {
-        new_state = LOCK_STATE_LOCKED;
-    } else if (f->msg_id == 0x02) {
+    if (f->period == ACTUATOR_ACTION_ON) {
         new_state = LOCK_STATE_UNLOCKED;
+    } else if (f->period == ACTUATOR_ACTION_OFF) {
+        new_state = LOCK_STATE_LOCKED;
     }
 
     if (new_state != LOCK_STATE_UNKNOWN) {
@@ -316,11 +319,11 @@ int periph_request_bms_status(uint8_t period_sec)
 
 int periph_send_lock(void)
 {
-    /* WRITE al modulo actuadores: MODULE=0x03, MSGID=0x01 (lock) */
-    uint8_t payload[3];
+    uint8_t payload[4];
     payload[0] = MODULE_ACTUATORS;
-    payload[1] = 0x01;  /* MSGID: lock */
-    payload[2] = 0x00;  /* sin periodo */
+    payload[1] = ACTUATOR_SMOD_LOCKER;
+    payload[2] = ACTUATOR_ACTION_OFF;  /* lock = desactivar */
+    payload[3] = 0x00;
 
     uint8_t frame_buf[32];
     int len = frame_build(FRAME_TYPE_WRITE, payload, sizeof(payload),
@@ -333,11 +336,11 @@ int periph_send_lock(void)
 
 int periph_send_unlock(void)
 {
-    /* WRITE al modulo actuadores: MODULE=0x03, MSGID=0x02 (unlock) */
-    uint8_t payload[3];
+    uint8_t payload[4];
     payload[0] = MODULE_ACTUATORS;
-    payload[1] = 0x02;  /* MSGID: unlock */
-    payload[2] = 0x00;  /* sin periodo */
+    payload[1] = ACTUATOR_SMOD_LOCKER;
+    payload[2] = ACTUATOR_ACTION_ON;  /* unlock = activar */
+    payload[3] = 0x00;
 
     uint8_t frame_buf[32];
     int len = frame_build(FRAME_TYPE_WRITE, payload, sizeof(payload),
