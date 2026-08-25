@@ -9,6 +9,11 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 
+/* Valores sensibles (SCOOTER_ID, APN_*, SCOOTER_TCP_*, DEVICE_SECRET) viven
+ * en config_local.h (gitignored). Copiar config_local.example.h a
+ * config_local.h y llenar con valores reales antes de compilar. */
+#include "config_local.h"
+
 // ---------------------------------------------------------------------------
 // UART módulo SIM7600
 // ---------------------------------------------------------------------------
@@ -25,20 +30,30 @@
 
 // ---------------------------------------------------------------------------
 // Configuración del scooter
+// NOTA: SCOOTER_ID vive en config_local.h (sensible, unico por dispositivo).
 // ---------------------------------------------------------------------------
-#define SCOOTER_ID        1
-#define SCOOTER_BATTERY    85
-#define SCOOTER_SPEED_KMH 15.5f
 #define UPDATE_INTERVAL_SEC 5
 #define RX_POLL_MS        150
+#define MIN_BATTERY_FOR_TELEMETRY 0  /* SoC minimo para enviar (0 = siempre) */
 
 // ---------------------------------------------------------------------------
-// Servidor TCP
-// Si la instancia (p. ej. EC2) cambia de IP al hacer stop/start, usa una
-// IP elástica o un hostname (DNS); si usas hostname, asegura DNS en el módulo.
+// UART electronica (BMS, actuadores) — UART1 remapeada
 // ---------------------------------------------------------------------------
-#define SCOOTER_TCP_HOST   "98.92.176.224"
-#define SCOOTER_TCP_PORT   8201
+#define PERIPH_UART_NUM     UART_NUM_1
+#define PERIPH_TX_PIN       GPIO_NUM_4
+#define PERIPH_RX_PIN       GPIO_NUM_5
+#define PERIPH_BAUD_RATE    115200
+
+// ---------------------------------------------------------------------------
+// BMS: intervalo de solicitud periodica
+// ---------------------------------------------------------------------------
+#define BMS_SOC_POLL_PERIOD_SEC     1   /* Solicitar SoC cada N segundos */
+#define BMS_STATUS_POLL_PERIOD_SEC  10  /* Solicitar control status cada N segundos */
+
+// ---------------------------------------------------------------------------
+// Servidor TCP + APN + DEVICE_SECRET viven en config_local.h (sensibles).
+// Si el backend cambia de IP al reiniciar, usar IP elastica o hostname (DNS).
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Conectividad y backoff (máquina de fallas)
@@ -64,13 +79,5 @@
 #define FRAME_DEBUG_FIELDS       0  /* log campo a campo al decodificar BMS */
 #define FRAME_DEBUG_TX           0  /* hex dump de frames enviados */
 #define FRAME_ACCEPT_BAD_CHKS    0  /* procesar frame aunque falle checksum (DEBUG ONLY) */
-
-// ---------------------------------------------------------------------------
-// Ubicaciones (Concepción, Chile)
-// ---------------------------------------------------------------------------
-typedef struct {
-    double latitude;
-    double longitude;
-} location_t;
 
 #endif /* APP_CONFIG_H */
