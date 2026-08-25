@@ -24,6 +24,7 @@
 #include "sim7600.h"
 #include "gps.h"
 #include "periph_uart.h"
+#include "heartbeat.h"
 
 static const char *TAG = "SIM7600";
 
@@ -2003,8 +2004,12 @@ sim7600_response_t sim7600_send_scooter_update(int link_num, int scooter_id,
     if (result == SIM7600_OK) {
         vTaskDelay(pdMS_TO_TICKS(80));
         ESP_LOGI(TAG, "✅ Actualización enviada");
+        /* Fix D (2026-08-17): notificar al heartbeat que hubo CIPSEND OK.
+         * Esto reinicia el timer de silencio; si pasan >90s sin este
+         * llamado el heartbeat forzara recovery a NET_DOWN. */
+        heartbeat_notify_send_ok();
     }
-    
+
     return result;
 }
 
@@ -2071,9 +2076,15 @@ void sim7600_scooter_update_loop(const char *server_ip, int server_port)
     ESP_LOGI(TAG, "[3.8/6] Iniciando tarea de lectura asíncrona...");
     async_read_active = true;
     xTaskCreate(sim7600_async_read_task, "sim7600_async_read", 4096, NULL, 5, NULL);
-    ESP_LOGI(TAG, "✓ Tarea de lectura asíncrona iniciada (modo: %s)", 
+    ESP_LOGI(TAG, "✓ Tarea de lectura asíncrona iniciada (modo: %s)",
              "Buffer (URCs + polling)");
     vTaskDelay(pdMS_TO_TICKS(300));
+
+    /* 3.9 Fix D (2026-08-17): heartbeat / self-check task.
+     * Cubre escenarios donde la telemetria queda bloqueada sin que ningun
+     * URC (+IPCLOSE, etc.) lo detecte. Ver heartbeat.h/heartbeat.c. */
+    ESP_LOGI(TAG, "[3.9/6] Iniciando heartbeat task (Fix D)...");
+    heartbeat_init();
 
     // Entramos al loop con la FSM en MODULE_OFFLINE. El primer paso del while(1)
     // detectara state != RUNNING y llamara connectivity_step_recovery que hace
