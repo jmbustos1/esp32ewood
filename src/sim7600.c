@@ -700,8 +700,15 @@ int sim7600_get_rx_buffer_length(int link_num)
     int total_len = 0;
     int64_t start_time = esp_timer_get_time() / 1000; // ms
     
-    while ((esp_timer_get_time() / 1000 - start_time) < RESPONSE_TIMEOUT_MS) {
-        int len = uart_read_bytes(UART_SIM, (uint8_t *)shared_response_buffer + total_len, 
+    /* Fix A (2026-08-25): timeout local mas corto (2s) para esta consulta trivial.
+     * AT+CIPRXGET=4,X pregunta cuantos bytes hay pendientes — el modem responde
+     * en <100ms en operacion normal. 2s es 20x el tiempo normal, suficiente
+     * margen para cargas altas pero corta rapido si el modem esta trabado.
+     * NO usar RESPONSE_TIMEOUT_MS (5s) global porque hacia peor caso del drain
+     * ~60s coincidente con el timeout del backend. */
+    const int64_t RX_LEN_TIMEOUT_MS = 2000;
+    while ((esp_timer_get_time() / 1000 - start_time) < RX_LEN_TIMEOUT_MS) {
+        int len = uart_read_bytes(UART_SIM, (uint8_t *)shared_response_buffer + total_len,
                                    sizeof(shared_response_buffer) - total_len - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
             total_len += len;
@@ -898,7 +905,14 @@ sim7600_response_t sim7600_drain_rx_buffer(int link_num)
     char rx_chunk[RX_CHUNK_SIZE + 1];
     int total_drained = 0;
     int iterations = 0;
-    const int MAX_ITERATIONS = 100; // Protección contra loops infinitos
+    /* Fix A (2026-08-25): bajado de 100 a 15.
+     * Con timeout de get_rx_buffer_length en 2s (era 5s), peor caso ahora es
+     * 15 iter × 2s = 30s. Antes era 100 × 5s = 500s (o realista 12 × 5s = 60s
+     * coincidiendo con el timeout del backend, disparando el bug zombi).
+     * 15 iter × 256 bytes = 3840 bytes drenables por ciclo — suficiente para
+     * comandos lock/unlock (<100 bytes). Si queda data pendiente, se drena
+     * en el proximo ciclo del loop principal (5-7s despues). */
+    const int MAX_ITERATIONS = 15;
     
     while (iterations < MAX_ITERATIONS) {
         iterations++;
