@@ -1566,10 +1566,19 @@ void sim7600_async_read_task(void *pvParameters)
                     // Detectar +IPCLOSE y +CIPERROR; filtrar respuestas AT
                     if (strstr((char*)temp_buffer, "+IPCLOSE:") != NULL) {
                         ESP_LOGW(TAG, "⚠ [URC] Conexión cerrada: %.*s", 100, temp_buffer);
+                        /* Bug 2 fix (2026-08-17): antes solo logueabamos y quedabamos
+                         * "zombi" pensando que la conexion seguia viva. Ahora notificamos
+                         * fallo de socket → FSM transita a SOCKET_DOWN y reintenta
+                         * CIPOPEN en el proximo ciclo del loop principal. */
+                        connectivity_notify_send_failed(false);
                         continue;
                     }
                     if (strstr((char*)temp_buffer, "+CIPERROR:") != NULL) {
                         ESP_LOGE(TAG, "⚠ [URC] Error TCP/IP: %.*s", 100, temp_buffer);
+                        /* +CIPERROR indica un problema mas serio del stack TCP/IP
+                         * (no solo el socket): tratarlo como error de red para que
+                         * la FSM haga recovery mas profundo (NET_DOWN). */
+                        connectivity_notify_send_failed(true);
                         continue;
                     }
                     if (strstr((char*)temp_buffer, "+CIPSEND:") != NULL ||
