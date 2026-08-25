@@ -2032,60 +2032,14 @@ void sim7600_scooter_update_loop(const char *server_ip, int server_port)
         ESP_LOGI(TAG, "✓ Mutex UART creado");
     }
 
-    // 1. Configurar modo NO transparente
-    ESP_LOGI(TAG, "[1/6] Configurando modo NO transparente...");
-    result = sim7600_set_cipmode(0);
-    if (result != SIM7600_OK) {
-        ESP_LOGW(TAG, "⚠ No se pudo cambiar modo (puede que ya esté en modo no transparente)");
-        ESP_LOGI(TAG, "   Continuando asumiendo modo no transparente (predeterminado)...");
-    } else {
-        ESP_LOGI(TAG, "✓ Modo no transparente configurado");
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // 1.5. Configurar modo buffer (AT+CIPRXGET=1)
-    ESP_LOGI(TAG, "[1.5/6] Configurando modo buffer (AT+CIPRXGET=1)...");
-    result = sim7600_set_buffer_mode(1);
-    if (result != SIM7600_OK) {
-        ESP_LOGE(TAG, "✗ Error configurando modo buffer");
-        ESP_LOGW(TAG, "   Continuando sin modo buffer...");
-    } else {
-        ESP_LOGI(TAG, "✓ Modo buffer configurado - Los datos se almacenarán en buffer interno");
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // 2. Activar contexto PDP
-    ESP_LOGI(TAG, "[2/6] Activando contexto PDP...");
-    result = sim7600_netopen();
-    if (result != SIM7600_OK) {
-        ESP_LOGE(TAG, "✗ Error activando contexto PDP");
-        return;
-    }
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    ESP_LOGI(TAG, "✓ Contexto PDP activado");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    // 2.5. Configurar DNS
-    ESP_LOGI(TAG, "[2.5/6] Configurando DNS...");
-    result = sim7600_set_dns("8.8.8.8", "8.8.4.4");
-    if (result == SIM7600_OK) {
-        ESP_LOGI(TAG, "✓ DNS configurado");
-    } else {
-        ESP_LOGW(TAG, "⚠ DNS no configurado (puede que ya esté configurado)");
-    }
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    /* [3/6] CIPOPEN hace idempotencia internamente (AT+CIPOPEN? y cierra link si ya está abierto) */
-    ESP_LOGI(TAG, "[3/6] Abriendo conexión TCP...");
-    result = sim7600_cipopen_tcp(0, server_ip, server_port);
-    if (result != SIM7600_OK) {
-        ESP_LOGE(TAG, "✗ Error abriendo conexión TCP");
-        ESP_LOGE(TAG, "  Código 4 = link ya abierto; 11 = DNS; 12 = conexión");
-        sim7600_netclose();
-        return;
-    }
-    ESP_LOGI(TAG, "✓ Conexión TCP establecida");
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // Setup del stack de red (CIPMODE, buffer, PDP, PAP, NETOPEN, DNS, CIPOPEN)
+    // se delega ENTERAMENTE a la FSM (`run_full_setup` en connectivity.c).
+    // La FSM hace polling AT integrado, respeta el orden correcto y transiciona
+    // a NET_DOWN/SOCKET_DOWN con backoff cuando algo falla — en vez de correr
+    // ciegamente los AT sabiendo que el modem no responde (lo que antes ocurria
+    // en cold boot o SIM desconectada, quemando ~3 min de timeouts inutiles).
+    // Cuando el modem esté listo, la FSM (arrancando en MODULE_OFFLINE) hace
+    // el setup completo y transiciona a RUNNING sola.
 
     // 3.6. Crear cola de comandos
     ESP_LOGI(TAG, "[3.6/6] Creando cola de comandos...");
@@ -2112,8 +2066,10 @@ void sim7600_scooter_update_loop(const char *server_ip, int server_port)
              "Buffer (URCs + polling)");
     vTaskDelay(pdMS_TO_TICKS(300));
 
-    connectivity_set_state(CONNECTIVITY_RUNNING);
-    ESP_LOGI(TAG, "\n🚀 Iniciando envío de actualizaciones...\n");
+    // Entramos al loop con la FSM en MODULE_OFFLINE. El primer paso del while(1)
+    // detectara state != RUNNING y llamara connectivity_step_recovery que hace
+    // polling AT y luego el setup completo (run_full_setup) cuando el modem responda.
+    ESP_LOGI(TAG, "\n🔄 Delegando establecimiento de conexion a la FSM (arranca en MODULE_OFFLINE)\n");
     
     // 4. Loop de actualizaciones (con máquina de conectividad + estados internos)
     current_state = STATE_RUN_IDLE;
