@@ -289,8 +289,13 @@ int periph_uart_init(void)
     ESP_LOGI(TAG, "UART1 inicializada (TX=GPIO%d, RX=GPIO%d, %d bps)",
              PERIPH_TX_PIN, PERIPH_RX_PIN, PERIPH_BAUD_RATE);
 
-    /* Iniciar tarea de recepcion */
-    xTaskCreate(periph_rx_task, "periph_rx", 4096, NULL, 4, NULL);
+    /* Iniciar tarea de recepcion.
+     * Fix E (2026-08-25): pinneado a CPU 1 para balancear carga.
+     * Antes caia a CPU 0 por default junto con FSM + loop principal.
+     * Con Bug 1 fixed ya no es critico, pero es defensivo: si en el futuro
+     * se activan flags DEBUG del BMS o el burst de bytes crece, CPU 0 no
+     * se ve afectada. Ademas el heartbeat task ya vive en CPU 1. */
+    xTaskCreatePinnedToCore(periph_rx_task, "periph_rx", 4096, NULL, 4, NULL, 1);
 
     return 0;
 }
