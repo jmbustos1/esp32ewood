@@ -14,6 +14,7 @@
 #include "app_config.h"
 #include "connectivity.h"
 #include "sim7600.h"
+#include "gps.h"
 
 static const char *TAG = "CONNECTIVITY";
 
@@ -97,6 +98,19 @@ static void run_full_setup(const char *server_ip, int server_port)
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
+
+    /* Re-activar motor GPS. El GPS engine del SIM7600 es independiente del radio
+     * celular y se apaga en resets internos del modem (watchdog interno, cambios
+     * de estado, CFUN=0/1). Si el ESP32 no se reinicia, gps_init de main.c NO
+     * corre de nuevo, y el scooter mandaria telemetria con lat/lng=0 hasta el
+     * proximo reboot fisico. gps_init es idempotente (chequea AT+CGPS? primero). */
+    ESP_LOGI(TAG, "[Setup] Re-activando GPS...");
+    if (gps_init() == 0) {
+        ESP_LOGI(TAG, "[Setup] GPS OK (ya activo o recien activado)");
+    } else {
+        ESP_LOGW(TAG, "[Setup] GPS init fallo, continuando (se reintentara en proxima recovery)");
+    }
+
     s_state = CONNECTIVITY_RUNNING;
     s_socket_backoff_index = 0;
     ESP_LOGI(TAG, "[Setup] OK → RUNNING");
