@@ -8,3 +8,9 @@
 # Cada colega copia include/config_local.example.h a include/config_local.h
 # y llena con los valores reales.
 include/config_local.h
+
+# sdkconfig regenerado por PlatformIO segun la version instalada de ESP-IDF.
+# Versionarlo genera crashes de kconfgen cuando distintos colaboradores tienen
+# versiones distintas de ESP-IDF. Cada uno lo regenera al primer `pio run`.
+sdkconfig*
+!sdkconfig.defaults
