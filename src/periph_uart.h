@@ -66,6 +66,19 @@ int periph_request_bms_soc(uint8_t period_sec);
 int periph_request_bms_status(uint8_t period_sec);
 
 /**
+ * Solicita lectura periodica del frame consolidado SYS STATUS
+ * (MODULE 0xFF MSGID 0x06). Trae voltaje/corriente/capacidad/SoC/estado/locker
+ * en un solo mensaje. Reemplaza al `periph_request_bms_soc`.
+ *
+ * El hub emite este frame por default cada 10s aunque no se solicite;
+ * con este comando se puede ajustar el period.
+ *
+ * @param period_sec  0=una vez, 1-250=intervalo en segundos
+ * @return 0 OK, -1 error
+ */
+int periph_request_system_status(uint8_t period_sec);
+
+/**
  * Envia comando lock al modulo de actuadores (MODULE 0x03).
  * @return 0 OK, -1 error
  */

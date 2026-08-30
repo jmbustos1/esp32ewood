@@ -139,6 +139,61 @@ static void process_bms_control_status(const frame_parsed_t *f)
              (unsigned long)s_bms_status.balance_status);
 }
 
+static void process_system_status(const frame_parsed_t *f)
+{
+    /* MODULE=0xFF MSGID=0x06 SYS STATUS (2026-08-30): frame consolidado.
+     * Layout: V(2B) + I(2B) + Cap(2B) + SoC(1B) + Sistema(1B) + Locker(1B) = 9 B */
+    if (f->data_len < 9) {
+        ESP_LOGW(TAG, "SYS STATUS: data_len=%u < 9", f->data_len);
+        return;
+    }
+
+#if FRAME_DEBUG_FIELDS
+    log_hex_dump("SYS STATUS raw DATA", f->data, f->data_len);
+#endif
+
+    uint16_t raw_voltage  = ((uint16_t)f->data[0] << 8) | f->data[1];
+    int16_t  raw_current  = (int16_t)(((uint16_t)f->data[2] << 8) | f->data[3]);
+    uint16_t raw_capacity = ((uint16_t)f->data[4] << 8) | f->data[5];
+    uint8_t  soc          = f->data[6];
+    uint8_t  sys_active   = f->data[7];
+    uint8_t  locker       = f->data[8];
+
+#if FRAME_DEBUG_FIELDS
+    ESP_LOGI(TAG, "  V=%.2fV  I=%.2fA  Cap=%.2fAh  SoC=%u%%  SysActive=0x%02X  Locker=0x%02X",
+             raw_voltage * 0.01f, raw_current * 0.01f, raw_capacity * 0.01f,
+             soc, sys_active, locker);
+#endif
+
+    lock_state_t new_lock_state;
+    if (locker == SYS_LOCKER_OPEN) {
+        new_lock_state = LOCK_STATE_UNLOCKED;
+    } else if (locker == SYS_LOCKER_CLOSED) {
+        new_lock_state = LOCK_STATE_LOCKED;
+    } else {
+        new_lock_state = LOCK_STATE_UNKNOWN;
+        ESP_LOGW(TAG, "SYS STATUS: valor Locker desconocido 0x%02X", locker);
+    }
+
+    xSemaphoreTake(s_data_mutex, portMAX_DELAY);
+    s_bms_power.voltage     = raw_voltage * 0.01f;
+    s_bms_power.current     = raw_current * 0.01f;
+    s_bms_power.capacity_ah = raw_capacity * 0.01f;
+    s_bms_power.soc         = soc;
+    s_bms_power.valid       = true;
+    /* Solo actualizamos lock_state si el byte trajo un valor reconocido.
+     * Asi evitamos borrar el estado por un frame invalido o parcial. */
+    if (new_lock_state != LOCK_STATE_UNKNOWN) {
+        s_lock_state = new_lock_state;
+    }
+    xSemaphoreGive(s_data_mutex);
+
+    ESP_LOGI(TAG, "SYS: %.2fV  %.2fA  SoC=%u%%  Locker=%s",
+             s_bms_power.voltage, s_bms_power.current, soc,
+             new_lock_state == LOCK_STATE_LOCKED   ? "CLOSED" :
+             new_lock_state == LOCK_STATE_UNLOCKED ? "OPEN"   : "UNKNOWN");
+}
+
 static void process_actuator_response(const frame_parsed_t *f)
 {
     /*
@@ -204,7 +259,16 @@ static void process_frame(const frame_parsed_t *f)
         break;
 
     case MODULE_SYSTEM:
-        ESP_LOGI(TAG, "Sistema MSGID=0x%02X", f->msg_id);
+        switch (f->msg_id) {
+        case SYS_MSGID_STATUS:
+            /* 2026-08-30: frame consolidado que reemplaza al BMS/VOLTAGE_SOC.
+             * Trae voltaje, corriente, capacidad, SoC, sistema activo y locker. */
+            process_system_status(f);
+            break;
+        default:
+            ESP_LOGD(TAG, "SYSTEM MSGID 0x%02X no manejado", f->msg_id);
+            break;
+        }
         break;
 
     default:
@@ -308,6 +372,20 @@ int periph_request_bms_soc(uint8_t period_sec)
     if (len < 0) return -1;
 
     ESP_LOGI(TAG, "Solicitando BMS SoC (period=%us)", period_sec);
+    return periph_send_frame(frame_buf, len);
+}
+
+int periph_request_system_status(uint8_t period_sec)
+{
+    /* 2026-08-30: solicita el frame consolidado (SoC + estado + locker).
+     * El hub emite este frame por default cada 10s aunque no se solicite;
+     * con este comando se puede ajustar el period. */
+    uint8_t frame_buf[32];
+    int len = frame_build_read(MODULE_SYSTEM, SYS_MSGID_STATUS, period_sec,
+                               frame_buf, sizeof(frame_buf));
+    if (len < 0) return -1;
+
+    ESP_LOGI(TAG, "Solicitando SYS STATUS (period=%us)", period_sec);
     return periph_send_frame(frame_buf, len);
 }
 

@@ -50,11 +50,16 @@ void app_main(void)
     if (periph_uart_init() == 0) {
         ESP_LOGI(TAG, "UART electronica OK");
 
-        // Solicitar SoC periodico al BMS
-        periph_request_bms_soc(BMS_SOC_POLL_PERIOD_SEC);
+        /* 2026-08-30: el hub cambio el protocolo. Ahora responde con MODULE=0xFF
+         * MSGID=0x06 SYS STATUS (frame consolidado: voltaje/corriente/SoC/estado/locker).
+         * El request al MODULE_BMS/MSGID 0x02 (VOLTAGE_SOC) YA NO se responde.
+         * Solicitamos el nuevo frame. El hub por default lo emite cada 10s
+         * aunque no se solicite; este comando permite ajustar el period. */
+        periph_request_system_status(BMS_SOC_POLL_PERIOD_SEC);
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Solicitar estado de control/proteccion periodico
+        // Solicitar estado de control/proteccion periodico (BMS MSGID 0x05).
+        // Complementa al SYS STATUS con info de proteccion/balance del BMS.
         periph_request_bms_status(BMS_STATUS_POLL_PERIOD_SEC);
     } else {
         ESP_LOGW(TAG, "UART electronica no disponible, usando valores por defecto");

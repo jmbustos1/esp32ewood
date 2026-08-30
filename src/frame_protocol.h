@@ -50,6 +50,26 @@ extern "C" {
 #define SYS_MSGID_RUN           0x02
 #define SYS_MSGID_FAULT         0x03
 #define SYS_MSGID_KEEP_ALIVE    0x04
+/* MSGID 0x06 SYS STATUS (2026-08-30): frame consolidado del hub de sensores.
+ * Reemplaza al MODULE_BMS/MSGID 0x02 (VOLTAGE_SOC) — el hub ya NO responde
+ * a ese comando. Layout del payload (9 bytes):
+ *   [0-1]  voltaje  (uint16 BE, x10 mV)
+ *   [2-3]  corriente (int16 BE, x10 mA)
+ *   [4-5]  capacidad residual (uint16 BE, x10 mAh)
+ *   [6]    SoC (uint8, %)
+ *   [7]    sistema activo (0x0F=inactivo, 0xFF=activo)
+ *   [8]    Locker (0x0F=cerrado, 0xFF=abierto)
+ * Por default el hub emite este frame cada 10s espontaneamente; se puede
+ * cambiar el period enviando un READ con MODULE=0xFF MSGID=0x06 Period=N. */
+#define SYS_MSGID_STATUS        0x06
+
+/* Valores del byte Locker en SYS_MSGID_STATUS */
+#define SYS_LOCKER_CLOSED       0x0F
+#define SYS_LOCKER_OPEN         0xFF
+
+/* Valores del byte Sistema activo en SYS_MSGID_STATUS */
+#define SYS_ACTIVE_INACTIVE     0x0F
+#define SYS_ACTIVE_ACTIVE       0xFF
 
 /* ── Tamanos ─────────────────────────────────────────────────────── */
 #define FRAME_SOF_SIZE      2
