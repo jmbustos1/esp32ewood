@@ -14,3 +14,6 @@ include/config_local.h
 # versiones distintas de ESP-IDF. Cada uno lo regenera al primer `pio run`.
 sdkconfig*
 !sdkconfig.defaults
+
+# Deuda técnica: vive en el repo privado exwood-bitacora (enlace simbólico)
+TECH_DEBT.md
