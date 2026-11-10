@@ -7,6 +7,16 @@ Desde el 2026-11-10 el firmware agrega un bloque `"d":{...}` a la telemetría TC
 - **Apagado**: `DIAG_TELEMETRY_ENABLED 0` en `src/app_config.h`.
 - **Backend**: guarda el último bloque en `scooters.last_diag` (JSONB) y registra en el log cuando cambia un campo clave. Ver "Del lado del backend" abajo.
 
+## Al flashear: compilar limpio
+
+ESP-IDF calcula `fw` al configurar CMake, no en cada compilación. Una compilación incremental puede dejar la versión de un commit anterior. Antes de flashear:
+
+```bash
+pio run -t clean && pio run -t upload
+```
+
+Compilar desde un árbol sin cambios: si no, `fw` termina en `-dirty` y no identifica el código exacto.
+
 ## Cuándo se envía
 
 No va en todos los mensajes:
