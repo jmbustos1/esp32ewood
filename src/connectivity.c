@@ -15,10 +15,20 @@
 #include "connectivity.h"
 #include "sim7600.h"
 #include "gps.h"
+#include "diag.h"
 
 static const char *TAG = "CONNECTIVITY";
 
 static connectivity_state_t s_state = CONNECTIVITY_MODULE_OFFLINE;
+
+/* Único punto de escritura de s_state: avisa a diag de cada transición. */
+static void fsm_set(connectivity_state_t next)
+{
+    if (s_state != next) {
+        diag_on_fsm_transition(s_state, next);
+    }
+    s_state = next;
+}
 static int s_socket_backoff_index = 0;
 static int s_at_timeout_count = 0;
 
@@ -67,7 +77,7 @@ static void run_full_setup(const char *server_ip, int server_port)
     ESP_LOGI(TAG, "[Setup] Verificando registro celular...");
     if (!sim7600_is_registered()) {
         ESP_LOGW(TAG, "[Setup] Sin registro celular → NET_DOWN (esperando senal)");
-        s_state = CONNECTIVITY_NET_DOWN;
+        fsm_set(CONNECTIVITY_NET_DOWN);
         return;
     }
     ESP_LOGI(TAG, "[Setup] Registro celular OK");
@@ -76,7 +86,7 @@ static void run_full_setup(const char *server_ip, int server_port)
     r = sim7600_netopen();
     if (r != SIM7600_OK) {
         ESP_LOGE(TAG, "[Setup] NETOPEN fallo → NET_DOWN");
-        s_state = CONNECTIVITY_NET_DOWN;
+        fsm_set(CONNECTIVITY_NET_DOWN);
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(3000));
@@ -93,7 +103,7 @@ static void run_full_setup(const char *server_ip, int server_port)
     r = sim7600_cipopen_tcp(0, server_ip, server_port);
     if (r != SIM7600_OK) {
         ESP_LOGE(TAG, "[Setup] CIPOPEN falló → SOCKET_DOWN");
-        s_state = CONNECTIVITY_SOCKET_DOWN;
+        fsm_set(CONNECTIVITY_SOCKET_DOWN);
         s_socket_backoff_index = 0;
         return;
     }
@@ -111,14 +121,14 @@ static void run_full_setup(const char *server_ip, int server_port)
         ESP_LOGW(TAG, "[Setup] GPS init fallo, continuando (se reintentara en proxima recovery)");
     }
 
-    s_state = CONNECTIVITY_RUNNING;
+    fsm_set(CONNECTIVITY_RUNNING);
     s_socket_backoff_index = 0;
     ESP_LOGI(TAG, "[Setup] OK → RUNNING");
 }
 
 void connectivity_init(void)
 {
-    s_state = CONNECTIVITY_MODULE_OFFLINE;
+    fsm_set(CONNECTIVITY_MODULE_OFFLINE);
     s_socket_backoff_index = 0;
     s_at_timeout_count = 0;
     ESP_LOGI(TAG, "Estado inicial: MODULE_OFFLINE (backoff reseteado)");
@@ -131,7 +141,7 @@ connectivity_state_t connectivity_get_state(void)
 
 void connectivity_set_state(connectivity_state_t state)
 {
-    s_state = state;
+    fsm_set(state);
     if (state == CONNECTIVITY_RUNNING) {
         s_socket_backoff_index = 0;
     }
@@ -150,7 +160,7 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
             return;
         }
         ESP_LOGI(TAG, "AT OK → MODULE_READY, ejecutando setup completo");
-        s_state = CONNECTIVITY_MODULE_READY;
+        fsm_set(CONNECTIVITY_MODULE_READY);
         s_at_timeout_count = 0;
         run_full_setup(server_ip, server_port);
         break;
@@ -183,7 +193,7 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(3000));
-        s_state = CONNECTIVITY_NET_READY;
+        fsm_set(CONNECTIVITY_NET_READY);
         ESP_LOGI(TAG, "NETOPEN OK → NET_READY");
         /* Intentar CIPOPEN en el mismo paso */
         r = sim7600_cipclose(0);
@@ -196,11 +206,11 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
             connectivity_notify_at_timeout();
         }
         if (r == SIM7600_OK) {
-            s_state = CONNECTIVITY_RUNNING;
+            fsm_set(CONNECTIVITY_RUNNING);
             s_socket_backoff_index = 0;
             ESP_LOGI(TAG, "CIPOPEN OK → RUNNING");
         } else {
-            s_state = CONNECTIVITY_SOCKET_DOWN;
+            fsm_set(CONNECTIVITY_SOCKET_DOWN);
             s_socket_backoff_index = 0;
             ESP_LOGI(TAG, "CIPOPEN falló → SOCKET_DOWN");
         }
@@ -217,11 +227,11 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
             connectivity_notify_at_timeout();
         }
         if (r == SIM7600_OK) {
-            s_state = CONNECTIVITY_RUNNING;
+            fsm_set(CONNECTIVITY_RUNNING);
             s_socket_backoff_index = 0;
             ESP_LOGI(TAG, "CIPOPEN OK → RUNNING");
         } else {
-            s_state = CONNECTIVITY_SOCKET_DOWN;
+            fsm_set(CONNECTIVITY_SOCKET_DOWN);
             s_socket_backoff_index = 0;
             ESP_LOGI(TAG, "CIPOPEN falló → SOCKET_DOWN");
         }
@@ -239,7 +249,7 @@ void connectivity_step_recovery(const char *server_ip, int server_port)
             connectivity_notify_at_timeout();
         }
         if (r == SIM7600_OK) {
-            s_state = CONNECTIVITY_RUNNING;
+            fsm_set(CONNECTIVITY_RUNNING);
             s_socket_backoff_index = 0;
             ESP_LOGI(TAG, "CIPOPEN OK → RUNNING");
         } else {
@@ -284,10 +294,10 @@ void connectivity_wait_backoff(void)
 void connectivity_notify_send_failed(bool is_network_error)
 {
     if (is_network_error) {
-        s_state = CONNECTIVITY_NET_DOWN;
+        fsm_set(CONNECTIVITY_NET_DOWN);
         ESP_LOGI(TAG, "Fallo envío (red) → NET_DOWN");
     } else {
-        s_state = CONNECTIVITY_SOCKET_DOWN;
+        fsm_set(CONNECTIVITY_SOCKET_DOWN);
         s_socket_backoff_index = 0;
         ESP_LOGI(TAG, "Fallo envío (socket) → SOCKET_DOWN");
     }
@@ -297,7 +307,7 @@ void connectivity_notify_at_timeout(void)
 {
     s_at_timeout_count++;
     if (s_at_timeout_count >= CONNECTIVITY_AT_TIMEOUT_COUNT) {
-        s_state = CONNECTIVITY_MODULE_OFFLINE;
+        fsm_set(CONNECTIVITY_MODULE_OFFLINE);
         s_at_timeout_count = 0;
         ESP_LOGI(TAG, "%d timeouts AT → MODULE_OFFLINE", CONNECTIVITY_AT_TIMEOUT_COUNT);
     }

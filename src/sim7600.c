@@ -23,6 +23,7 @@
 #include "connectivity.h"
 #include "sim7600.h"
 #include "gps.h"
+#include "diag.h"
 #include "periph_uart.h"
 #include "heartbeat.h"
 
@@ -1963,7 +1964,9 @@ sim7600_response_t sim7600_send_scooter_update(int link_num, int scooter_id,
                                                 double latitude, double longitude,
                                                 int battery, float speed_kmh)
 {
-    char json_buffer[256];
+    /* 512: la telemetria base ocupa ~190 bytes y el bloque "d" ~140.
+     * static: no crece el stack de app_main. Solo la llama el loop principal. */
+    static char json_buffer[512];
     int json_len;
     
     // Obtener estado de lock y voltaje para incluir en telemetria
@@ -1977,10 +1980,22 @@ sim7600_response_t sim7600_send_scooter_update(int link_num, int scooter_id,
                        "{\"scooter_id\":%d,\"device_secret\":\"%s\","
                        "\"latitude\":%.6f,\"longitude\":%.6f,"
                        "\"battery_level\":%d,\"speed_kmh\":%.1f,"
-                       "\"lock_state\":\"%s\",\"voltage\":%.2f}\n",
+                       "\"lock_state\":\"%s\",\"voltage\":%.2f",
                        scooter_id, DEVICE_SECRET,
                        latitude, longitude, battery, speed_kmh,
                        lock_str, bms.valid ? bms.voltage : 0.0f);
+
+    /* Bloque de diagnostico "d" (docs/DIAGNOSTICO.md). Reserva 3 bytes
+     * para el cierre "}\n\0"; si no cabe, diag_append_json no escribe nada. */
+    if (json_len > 0 && json_len < (int)sizeof(json_buffer) - 3) {
+        json_len += diag_append_json(json_buffer + json_len,
+                                     sizeof(json_buffer) - 3 - json_len);
+    }
+    if (json_len > 0 && json_len < (int)sizeof(json_buffer) - 2) {
+        json_buffer[json_len++] = '}';
+        json_buffer[json_len++] = '\n';
+        json_buffer[json_len] = '\0';
+    }
     
     // Verificar que el JSON sea válido (debe tener al menos el formato básico)
     if (json_len <= 0) {

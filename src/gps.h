@@ -7,6 +7,8 @@
 #ifndef GPS_H
 #define GPS_H
 
+#include <stdint.h>
+
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -55,5 +57,11 @@ gps_position_t gps_get_position(void);
 #ifdef __cplusplus
 }
 #endif
+
+/** Veces que se recicló el motor GNSS desde el arranque (Fix H). */
+int gps_get_recycle_count(void);
+
+/** Milisegundos desde el último fix real; -1 si nunca hubo fix desde el arranque. */
+int64_t gps_get_fix_age_ms(void);
 
 #endif /* GPS_H */

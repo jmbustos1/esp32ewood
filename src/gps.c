@@ -74,6 +74,19 @@ static void gps_recycle_engine(void)
     s_nofix_streak = 0;
 }
 
+/* Cuenta un update sin fix y recicla el motor al llegar al umbral. Se usa
+ * tanto para "sin fix" como para ERROR/respuesta inesperada: un motor GNSS
+ * apagado o colgado puede responder así, y antes esos casos no sumaban al
+ * contador, por lo que el reciclaje nunca se disparaba. */
+static void gps_count_nofix(const char *reason)
+{
+    s_nofix_streak++;
+    ESP_LOGW(TAG, "Sin fix GPS: %s (streak=%d/%d)", reason, s_nofix_streak, GPS_NOFIX_RECYCLE_STREAK);
+    if (s_nofix_streak >= GPS_NOFIX_RECYCLE_STREAK) {
+        gps_recycle_engine();
+    }
+}
+
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
 /**
@@ -144,7 +157,7 @@ int gps_update(void)
 
     sim7600_response_t r = sim7600_send_command("AT+CGPSINFO\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS);
     if (r != SIM7600_OK) {
-        ESP_LOGW(TAG, "Error AT+CGPSINFO");
+        gps_count_nofix("error AT+CGPSINFO");
         return -1;
     }
 
@@ -158,6 +171,7 @@ int gps_update(void)
     char *info = strstr(buf, "+CGPSINFO:");
     if (info == NULL) {
         ESP_LOGW(TAG, "Respuesta inesperada: %s", buf);
+        gps_count_nofix("respuesta inesperada");
         return -1;
     }
 
@@ -168,11 +182,7 @@ int gps_update(void)
 
     /* Verificar si hay fix: si el primer campo esta vacio, no hay fix */
     if (*info == ',' || *info == '\r' || *info == '\n' || *info == '\0') {
-        s_nofix_streak++;
-        ESP_LOGW(TAG, "Sin fix GPS (streak=%d/%d)", s_nofix_streak, GPS_NOFIX_RECYCLE_STREAK);
-        if (s_nofix_streak >= GPS_NOFIX_RECYCLE_STREAK) {
-            gps_recycle_engine();
-        }
+        gps_count_nofix("sin fix");
         return 1; /* Sin fix, posicion anterior se mantiene */
     }
 
@@ -193,6 +203,7 @@ int gps_update(void)
 
     if (parsed < 4) {
         ESP_LOGW(TAG, "Parse incompleto (%d campos): %s", parsed, info);
+        gps_count_nofix("parse incompleto");
         return 1;
     }
 
@@ -212,6 +223,7 @@ int gps_update(void)
     /* Validacion basica de coordenadas */
     if (fabs(lat) > 90.0 || fabs(lon) > 180.0) {
         ESP_LOGW(TAG, "Coordenadas fuera de rango: %.6f, %.6f", lat, lon);
+        gps_count_nofix("coordenadas fuera de rango");
         return 1;
     }
 
@@ -245,4 +257,17 @@ gps_position_t gps_get_position(void)
         }
     }
     return s_last_pos;
+}
+
+int gps_get_recycle_count(void)
+{
+    return s_recycle_count;
+}
+
+int64_t gps_get_fix_age_ms(void)
+{
+    if (s_last_fix_ms == 0) {
+        return -1; /* Nunca hubo fix desde el arranque */
+    }
+    return (esp_timer_get_time() / 1000) - s_last_fix_ms;
 }

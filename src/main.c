@@ -17,6 +17,7 @@
 #include "sim7600.h"
 #include "gps.h"
 #include "periph_uart.h"
+#include "diag.h"
 
 static const char *TAG = "MAIN";
 
@@ -27,6 +28,8 @@ static char response_buf[BUF_SIZE] __attribute__((unused));
 
 void app_main(void)
 {
+    diag_init();  /* motivo de arranque para el bloque "d" de telemetria */
+
     sim7600_response_t result __attribute__((unused));
 
     // Configuración UART SIM7600

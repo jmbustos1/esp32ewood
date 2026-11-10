@@ -80,4 +80,11 @@
 #define FRAME_DEBUG_TX           0  /* hex dump de frames enviados */
 #define FRAME_ACCEPT_BAD_CHKS    0  /* procesar frame aunque falle checksum (DEBUG ONLY) */
 
+/* ──────────────────────────────────────────────────────────────────
+ * Diagnóstico en telemetría (bloque "d"). Ver docs/DIAGNOSTICO.md.
+ * DIAG_TELEMETRY_ENABLED=0 lo apaga sin tocar nada más.
+ * ────────────────────────────────────────────────────────────────── */
+#define DIAG_TELEMETRY_ENABLED   1
+#define DIAG_EVERY_N_MESSAGES    10  /* ademas se envia apenas cambia un campo clave */
+
 #endif /* APP_CONFIG_H */

@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 
 #include "connectivity.h"
+#include "diag.h"
 
 static const char *TAG = "HEARTBEAT";
 
@@ -71,6 +72,7 @@ static void heartbeat_task(void *pv)
         ESP_LOGE(TAG, "🚨 Heartbeat expiro: %llds sin CIPSEND OK. Forzando recovery (NET_DOWN).",
                  (long long)(silence_us / 1000000));
         s_last_trigger_us = now;
+        diag_on_heartbeat_trigger();
         connectivity_notify_send_failed(true);
     }
 }
