@@ -8,6 +8,7 @@
  */
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -108,6 +109,23 @@ static double nmea_to_degrees(const char *raw, int deg_digits)
 }
 
 /**
+ * Valida un campo NMEA de lat/lon: deg_digits dígitos de grados, 2 de
+ * minutos, '.', y al menos un decimal (ej. "3647.823000" o "07303.598000").
+ * Respuestas de AT+CGPSINFO cortadas o mezcladas con otra respuesta
+ * produjeron fixes falsos en produccion (lat -36.000000, lon +73.000000).
+ */
+static bool nmea_coord_ok(const char *raw, int deg_digits)
+{
+    int dot = deg_digits + 2;
+    int len = (int)strlen(raw);
+    if (len < dot + 2 || raw[dot] != '.') return false;
+    for (int i = 0; i < len; i++) {
+        if (i != dot && (raw[i] < '0' || raw[i] > '9')) return false;
+    }
+    return true;
+}
+
+/**
  * Convierte velocidad de nudos a km/h.
  */
 static float knots_to_kmh(float knots)
@@ -204,6 +222,15 @@ int gps_update(void)
     if (parsed < 4) {
         ESP_LOGW(TAG, "Parse incompleto (%d campos): %s", parsed, info);
         gps_count_nofix("parse incompleto");
+        return 1;
+    }
+
+    /* Rechazar campos mal formados (respuesta cortada o mezclada) */
+    bool ns_ok = (ns[0] == 'N' || ns[0] == 'S') && ns[1] == '\0';
+    bool ew_ok = (ew[0] == 'E' || ew[0] == 'W') && ew[1] == '\0';
+    if (!ns_ok || !ew_ok || !nmea_coord_ok(lat_str, 2) || !nmea_coord_ok(lon_str, 3)) {
+        ESP_LOGW(TAG, "Fix mal formado, descartado: lat=%s %s lon=%s %s", lat_str, ns, lon_str, ew);
+        gps_count_nofix("fix mal formado");
         return 1;
     }
 
