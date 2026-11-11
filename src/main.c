@@ -148,6 +148,11 @@ void app_main(void)
     // via polling AT desde MODULE_OFFLINE — no necesita nada configurado
     // previamente en el modem.
     ESP_LOGI(TAG, "=== Iniciando servicio de scooter (FSM lo hara todo) ===");
+    /* Tarea de mantenimiento GNSS (reciclaje/arranque en frio sin bloquear el loop) */
+    if (gps_maint_init() != 0) {
+        ESP_LOGE("MAIN", "No se pudo crear la tarea gps_maint");
+    }
+
     sim7600_scooter_update_loop(SCOOTER_TCP_HOST, SCOOTER_TCP_PORT);
 
     // Nota: sim7600_scooter_update_loop() tiene un loop infinito

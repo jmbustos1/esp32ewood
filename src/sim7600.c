@@ -26,6 +26,7 @@
 #include "diag.h"
 #include "periph_uart.h"
 #include "heartbeat.h"
+#include "esp_system.h"
 
 static const char *TAG = "SIM7600";
 
@@ -1648,6 +1649,13 @@ void sim7600_async_read_task(void *pvParameters)
 sim7600_response_t sim7600_send_ack(const char *command_id, const char *command, const char *timestamp, 
                                     const char *client_id, const char *request_id, int message_id)
 {
+    return sim7600_send_ack_ex(command_id, command, timestamp, client_id, request_id, message_id, "ok", NULL);
+}
+
+sim7600_response_t sim7600_send_ack_ex(const char *command_id, const char *command, const char *timestamp,
+                                       const char *client_id, const char *request_id, int message_id,
+                                       const char *status, const char *result_json)
+{
     char ack_json[512];
     int ack_len;
     
@@ -1656,15 +1664,15 @@ sim7600_response_t sim7600_send_ack(const char *command_id, const char *command,
     // Si no hay command_id, usar message_id como fallback
     if (command_id != NULL && command_id[0] != '\0') {
         ack_len = snprintf(ack_json, sizeof(ack_json),
-                          "{\"id\":\"%s\",\"type\":\"ack\",\"status\":\"ok\",\"command\":\"%s\",\"original_timestamp\":\"%s\"",
-                          command_id, command, timestamp);
+                          "{\"id\":\"%s\",\"type\":\"ack\",\"status\":\"%s\",\"command\":\"%s\",\"original_timestamp\":\"%s\"",
+                          command_id, status, command, timestamp);
     } else {
         // Fallback: usar message_id como id
         char fallback_id[32];
         snprintf(fallback_id, sizeof(fallback_id), "c-%d", message_id);
         ack_len = snprintf(ack_json, sizeof(ack_json),
-                          "{\"id\":\"%s\",\"type\":\"ack\",\"status\":\"ok\",\"command\":\"%s\",\"original_timestamp\":\"%s\"",
-                          fallback_id, command, timestamp);
+                          "{\"id\":\"%s\",\"type\":\"ack\",\"status\":\"%s\",\"command\":\"%s\",\"original_timestamp\":\"%s\"",
+                          fallback_id, status, command, timestamp);
     }
     
     // Agregar client_id si existe
@@ -1679,6 +1687,12 @@ sim7600_response_t sim7600_send_ack(const char *command_id, const char *command,
                           ",\"request_id\":\"%s\"", request_id);
     }
     
+    // Resultado del comando (objeto JSON ya armado), si hay
+    if (result_json != NULL && result_json[0] != '\0') {
+        ack_len += snprintf(ack_json + ack_len, sizeof(ack_json) - ack_len,
+                          ",\"result\":%s", result_json);
+    }
+
     // Cerrar JSON y agregar \n (NDJSON)
     ack_len += snprintf(ack_json + ack_len, sizeof(ack_json) - ack_len, "}\n");
     
@@ -1699,6 +1713,71 @@ sim7600_response_t sim7600_send_ack(const char *command_id, const char *command,
  * 
  * @param pvParameters Parámetros de la tarea (no usado)
  */
+/* Extrae el valor exacto de "command" de un JSON plano. */
+static bool json_get_command(const char *json, char *out, size_t cap)
+{
+    const char *p = strstr(json, "\"command\"");
+    if (p == NULL) return false;
+    p = strchr(p + 9, ':');
+    if (p == NULL) return false;
+    p++;
+    while (*p == ' ') p++;
+    if (*p != '"') return false;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n < cap - 1) out[n++] = *p++;
+    out[n] = '\0';
+    return *p == '"' && n > 0;
+}
+
+static void ack_command(const command_queue_item_t *it, const char *cmd, const char *status, const char *result)
+{
+    sim7600_response_t r = sim7600_send_ack_ex(it->command_id, cmd, it->timestamp, it->client_id,
+                                               it->request_id, it->message_id, status, result);
+    if (r == SIM7600_OK) {
+        ESP_LOGI(TAG, "✅ ACK %s enviado (%s, message_id: %d)", status, cmd, it->message_id);
+    } else {
+        ESP_LOGW(TAG, "⚠ ACK falló (%s, message_id: %d) - el backend reintentara", cmd, it->message_id);
+    }
+}
+
+/* Comandos soportados. Al agregar uno: el nombre no debe contener "lock"
+ * (la ruta de texto plano busca esa palabra) y hay que sumarlo a
+ * adminCommands en el backend. */
+static void process_command(const command_queue_item_t *it, const char *cmd)
+{
+    if (strcmp(cmd, "unlock") == 0) {
+        ESP_LOGI(TAG, "🔓 [ID: %d] Ejecutando comando UNLOCK", it->message_id);
+        periph_send_unlock();
+        ack_command(it, cmd, "ok", NULL);
+    } else if (strcmp(cmd, "lock") == 0) {
+        ESP_LOGI(TAG, "🔒 [ID: %d] Ejecutando comando LOCK", it->message_id);
+        periph_send_lock();
+        ack_command(it, cmd, "ok", NULL);
+    } else if (strcmp(cmd, "gps_status") == 0) {
+        char res[160];
+        gps_status_json(res, sizeof(res));
+        ESP_LOGI(TAG, "🛰️ [ID: %d] gps_status: %s", it->message_id, res);
+        ack_command(it, cmd, "ok", res);
+    } else if (strcmp(cmd, "gps_recycle") == 0 || strcmp(cmd, "gps_cold") == 0) {
+        gps_maint_action_t a = strcmp(cmd, "gps_cold") == 0 ? GPS_MAINT_COLD : GPS_MAINT_RECYCLE;
+        if (gps_request_maintenance(a)) {
+            ESP_LOGW(TAG, "🛰️ [ID: %d] %s encolado", it->message_id, cmd);
+            ack_command(it, cmd, "ok", "{\"queued\":true}");
+        } else {
+            ack_command(it, cmd, "error", "{\"error\":\"gps_busy\"}");
+        }
+    } else if (strcmp(cmd, "reboot") == 0) {
+        ESP_LOGW(TAG, "🔁 [ID: %d] Reinicio pedido por el servidor", it->message_id);
+        ack_command(it, cmd, "ok", NULL);
+        vTaskDelay(pdMS_TO_TICKS(1500)); /* dar tiempo a que salga el ACK */
+        esp_restart();
+    } else {
+        ESP_LOGW(TAG, "⚠ Comando desconocido (ID: %d): %s", it->message_id, cmd);
+        ack_command(it, cmd, "error", "{\"error\":\"unknown_command\"}");
+    }
+}
+
 void sim7600_command_processor_task(void *pvParameters)
 {
     command_queue_item_t cmd_item;
@@ -1710,43 +1789,18 @@ void sim7600_command_processor_task(void *pvParameters)
         if (xQueueReceive(command_queue, &cmd_item, portMAX_DELAY) == pdTRUE) {
             ESP_LOGI(TAG, "🔄 Procesando comando de la cola (ID: %d)", cmd_item.message_id);
             
-            // Procesar comando unlock o lock
-            if (strstr(cmd_item.command, "\"command\"") != NULL) {
-                const char *cmd_name = NULL;
-                if (strstr(cmd_item.command, "\"unlock\"") != NULL) {
-                    cmd_name = "unlock";
-                    ESP_LOGI(TAG, "🔓 [ID: %d] Ejecutando comando UNLOCK", cmd_item.message_id);
-                } else if (strstr(cmd_item.command, "\"lock\"") != NULL) {
-                    cmd_name = "lock";
-                    ESP_LOGI(TAG, "🔒 [ID: %d] Ejecutando comando LOCK", cmd_item.message_id);
-                }
-                
-                if (cmd_name != NULL) {
-                    // Enviar comando a actuadores via UART1
-                    if (strcmp(cmd_name, "unlock") == 0) {
-                        periph_send_unlock();
-                    } else if (strcmp(cmd_name, "lock") == 0) {
-                        periph_send_lock();
-                    }
-                    // Enviar ACK al servidor
-                    sim7600_response_t ack_result = sim7600_send_ack(cmd_item.command_id, cmd_name, cmd_item.timestamp,
-                                                                      cmd_item.client_id, cmd_item.request_id,
-                                                                      cmd_item.message_id);
-                    if (ack_result == SIM7600_OK) {
-                        ESP_LOGI(TAG, "✅ ACK inmediato enviado (ID: %s, message_id: %d)", 
-                                cmd_item.command_id[0] != '\0' ? cmd_item.command_id : "N/A", cmd_item.message_id);
-                    } else {
-                        ESP_LOGW(TAG, "⚠ ACK inmediato falló (ID: %d) - El backend debe hacer retry", cmd_item.message_id);
-                    }
-                } else {
-                    ESP_LOGW(TAG, "⚠ Comando desconocido en cola (ID: %d): %s", cmd_item.message_id, cmd_item.command);
-                }
-            } else {
-                ESP_LOGW(TAG, "⚠ Comando desconocido en cola (ID: %d): %s", cmd_item.message_id, cmd_item.command);
+            /* Despacho por nombre EXACTO del campo "command" (docs: backend
+             * docs/COMANDOS_EMERGENCIA.md). Antes se buscaba el texto
+             * "unlock"/"lock" en todo el mensaje. */
+            char cmd_name[32];
+            if (!json_get_command(cmd_item.command, cmd_name, sizeof(cmd_name))) {
+                ESP_LOGW(TAG, "⚠ Comando sin campo command (ID: %d): %s", cmd_item.message_id, cmd_item.command);
+                continue;
             }
+            process_command(&cmd_item, cmd_name);
         }
     }
-    
+
     ESP_LOGI(TAG, "⚙️ Tarea procesadora de comandos finalizada");
     vTaskDelete(NULL);
 }

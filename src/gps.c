@@ -15,6 +15,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -58,21 +59,102 @@ static int s_nofix_streak = 0;
 static int64_t s_last_fix_ms = 0;
 static int s_recycle_count = 0;
 
-static void gps_recycle_engine(void)
+/* ── Mantenimiento del motor GNSS ─────────────────────────────────────
+ *
+ * Reciclar o hacer arranque en frio puede tardar hasta ~35 s: tras
+ * AT+CGPS=0 hay que esperar 2-30 s antes de reencender (manual AT SIM7500/
+ * SIM7600 V3.00, pag. 369-370) y CGPSDEL exige el GPS detenido (pag. 379).
+ * Para no bloquear el loop principal (telemetria y drenaje de comandos), lo
+ * ejecuta una tarea propia. El loop y los comandos solo encolan la accion.
+ * Mientras corre, gps_update no consulta CGPSINFO ni suma al streak.
+ */
+#define GPS_STOP_POLL_MS      2000
+#define GPS_STOP_TIMEOUT_MS   30000
+#define GPS_START_RETRIES     3
+
+static QueueHandle_t s_maint_queue = NULL;
+static volatile bool s_maint_busy = false;
+
+/* Apaga el motor y espera a que AT+CGPS? confirme "+CGPS: 0". */
+static bool gps_engine_stop_wait(void)
 {
     char buf[128];
-    s_recycle_count++;
-    ESP_LOGW(TAG, "Reciclando motor GNSS (SIM7600) tras %d updates sin fix (recycle #%d)",
-             s_nofix_streak, s_recycle_count);
     sim7600_send_command("AT+CGPS=0\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    sim7600_response_t r = sim7600_send_command("AT+CGPS=1,1\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS);
-    if (r == SIM7600_OK) {
-        ESP_LOGI(TAG, "Motor GNSS reciclado; esperando fix nuevo (TTFF puede tardar 30-90s)");
-    } else {
-        ESP_LOGE(TAG, "Falla reciclando GNSS (AT+CGPS=1,1) — se reintentara en el proximo streak");
+    for (int waited = 0; waited <= GPS_STOP_TIMEOUT_MS; waited += GPS_STOP_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(GPS_STOP_POLL_MS));
+        if (sim7600_send_command("AT+CGPS?\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS) == SIM7600_OK &&
+            strstr(buf, "+CGPS: 0") != NULL) {
+            return true;
+        }
     }
-    s_nofix_streak = 0;
+    ESP_LOGE(TAG, "El motor GNSS no confirmo el apagado en %d s", GPS_STOP_TIMEOUT_MS / 1000);
+    return false;
+}
+
+/* Enciende el motor en standalone, reintentando si responde ERROR. */
+static bool gps_engine_start(void)
+{
+    char buf[128];
+    for (int i = 0; i < GPS_START_RETRIES; i++) {
+        if (sim7600_send_command("AT+CGPS=1,1\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS) == SIM7600_OK) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(GPS_STOP_POLL_MS));
+    }
+    ESP_LOGE(TAG, "Falla encendiendo GNSS (AT+CGPS=1,1) tras %d intentos", GPS_START_RETRIES);
+    return false;
+}
+
+static void gps_run_action(gps_maint_action_t action)
+{
+    char buf[64];
+    bool ok = gps_engine_stop_wait();
+    if (ok && action == GPS_MAINT_COLD) {
+        /* Borra efemerides/almanaque: el proximo inicio es en frio. */
+        ok = sim7600_send_command("AT+CGPSDEL\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS) == SIM7600_OK;
+        if (!ok) ESP_LOGE(TAG, "Falla AT+CGPSDEL");
+    }
+    /* Encender igual aunque el apagado no se haya confirmado: peor es dejarlo apagado. */
+    bool started = gps_engine_start();
+    s_recycle_count++;
+    ESP_LOGW(TAG, "Motor GNSS %s (#%d): %s",
+             action == GPS_MAINT_COLD ? "arranque en frio" : "reciclado",
+             s_recycle_count, (ok && started) ? "OK, esperando fix (TTFF 30-90 s)" : "con errores");
+}
+
+static void gps_maint_task(void *arg)
+{
+    gps_maint_action_t action;
+    while (1) {
+        if (xQueueReceive(s_maint_queue, &action, portMAX_DELAY) == pdTRUE) {
+            s_maint_busy = true;
+            gps_run_action(action);
+            s_nofix_streak = 0;
+            s_maint_busy = false;
+        }
+    }
+}
+
+int gps_maint_init(void)
+{
+    if (s_maint_queue != NULL) return 0;
+    s_maint_queue = xQueueCreate(1, sizeof(gps_maint_action_t));
+    if (s_maint_queue == NULL) return -1;
+    if (xTaskCreatePinnedToCore(gps_maint_task, "gps_maint", 3072, NULL, 2, NULL, 0) != pdPASS) {
+        return -1;
+    }
+    return 0;
+}
+
+bool gps_request_maintenance(gps_maint_action_t action)
+{
+    if (s_maint_queue == NULL || s_maint_busy) return false;
+    return xQueueSend(s_maint_queue, &action, 0) == pdTRUE;
+}
+
+bool gps_maintenance_busy(void)
+{
+    return s_maint_busy;
 }
 
 /* Cuenta un update sin fix y recicla el motor al llegar al umbral. Se usa
@@ -84,7 +166,10 @@ static void gps_count_nofix(const char *reason)
     s_nofix_streak++;
     ESP_LOGW(TAG, "Sin fix GPS: %s (streak=%d/%d)", reason, s_nofix_streak, GPS_NOFIX_RECYCLE_STREAK);
     if (s_nofix_streak >= GPS_NOFIX_RECYCLE_STREAK) {
-        gps_recycle_engine();
+        if (gps_request_maintenance(GPS_MAINT_RECYCLE)) {
+            ESP_LOGW(TAG, "Reciclaje GNSS encolado tras %d updates sin fix", s_nofix_streak);
+        }
+        s_nofix_streak = 0;
     }
 }
 
@@ -172,6 +257,10 @@ int gps_stop(void)
 int gps_update(void)
 {
     char buf[512];
+
+    if (s_maint_busy) {
+        return 1; /* Motor en mantenimiento: no consultar ni sumar al streak */
+    }
 
     sim7600_response_t r = sim7600_send_command("AT+CGPSINFO\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS);
     if (r != SIM7600_OK) {
@@ -298,3 +387,44 @@ int64_t gps_get_fix_age_ms(void)
     }
     return (esp_timer_get_time() / 1000) - s_last_fix_ms;
 }
+
+
+/* Lee el campo n (0-based) de una lista separada por comas; vacio -> -1. */
+static int csv_int_field(const char *p, int n)
+{
+    for (int i = 0; i < n && p; i++) {
+        p = strchr(p, ',');
+        if (p) p++;
+    }
+    if (p == NULL || *p == ',' || *p == '\r' || *p == '\n' || *p == '\0') return -1;
+    return atoi(p);
+}
+
+int gps_status_json(char *out, size_t cap)
+{
+    char buf[256];
+    int on = -1, mode = -1, fix = -1, sv_gps = -1, sv_glo = -1, sv_bds = -1;
+
+    if (sim7600_send_command("AT+CGPS?\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS) == SIM7600_OK) {
+        char *p = strstr(buf, "+CGPS:");
+        if (p) sscanf(p, "+CGPS: %d,%d", &on, &mode);
+    }
+    /* +CGNSSINFO: [mode],[GPS-SVs],[GLONASS-SVs],[BEIDOU-SVs],... (pag. 387-388) */
+    if (sim7600_send_command("AT+CGNSSINFO\r\n", buf, sizeof(buf), RESPONSE_TIMEOUT_MS) == SIM7600_OK) {
+        char *p = strstr(buf, "+CGNSSINFO:");
+        if (p) {
+            p += strlen("+CGNSSINFO:");
+            while (*p == ' ') p++;
+            fix = csv_int_field(p, 0);
+            sv_gps = csv_int_field(p, 1);
+            sv_glo = csv_int_field(p, 2);
+            sv_bds = csv_int_field(p, 3);
+        }
+    }
+    int64_t age = gps_get_fix_age_ms();
+    return snprintf(out, cap,
+                    "{\"on\":%d,\"mode\":%d,\"fix\":%d,\"sv\":[%d,%d,%d],\"fa\":%lld,\"gr\":%d,\"busy\":%d}",
+                    on, mode, fix, sv_gps, sv_glo, sv_bds,
+                    (long long)(age < 0 ? -1 : age / 1000), s_recycle_count, s_maint_busy ? 1 : 0);
+}
+

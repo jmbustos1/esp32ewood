@@ -93,6 +93,14 @@ void sim7600_process_server_command(const char *data, size_t len);
 void sim7600_async_read_task(void *pvParameters);
 sim7600_response_t sim7600_send_ack(const char *command_id, const char *command, const char *timestamp,
                                     const char *client_id, const char *request_id, int message_id);
+
+/**
+ * Como sim7600_send_ack, con estado y resultado: status "ok" o "error";
+ * result_json es un objeto JSON ya armado (o NULL) que se envía como "result".
+ */
+sim7600_response_t sim7600_send_ack_ex(const char *command_id, const char *command, const char *timestamp,
+                                       const char *client_id, const char *request_id, int message_id,
+                                       const char *status, const char *result_json);
 void sim7600_command_processor_task(void *pvParameters);
 
 // ---------------------------------------------------------------------------

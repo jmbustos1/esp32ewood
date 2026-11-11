@@ -49,7 +49,7 @@ Si el bloque no cabe en el buffer (512 bytes; en el peor caso el JSON completo u
 | `hb` | Disparos del heartbeat | contador | Veces que el heartbeat (Fix D, CPU 1) forzó recuperación por 90 s sin `CIPSEND` OK. |
 | `gv` | GPS válido | 0/1 | 1 si la posición enviada es un fix de menos de 150 s. 0 = la lat/lng enviada es vieja o 0,0. |
 | `fa` | Edad del fix | segundos | Desde el último fix real. **-1 = nunca hubo fix desde el arranque** (en ese caso lat/lng = 0,0). |
-| `gr` | Reciclajes del GNSS | contador | Veces que el Fix H apagó y prendió el motor GNSS (cada 30 lecturas sin fix, contando errores). |
+| `gr` | Reciclajes del GNSS | contador | Reciclajes y arranques en frío terminados desde el arranque: automáticos (Fix H, cada 30 lecturas sin fix contando errores) y por comando (`gps_recycle`, `gps_cold`). Cada uno confirma el apagado con `AT+CGPS?` antes de reencender. |
 | `bv` | BMS válido | 0/1 | 1 si el BMS respondió. 0 = `battery_level` y `voltage` no son reales. |
 
 ### `st` / `ps`: estados de la FSM
@@ -70,7 +70,7 @@ Un mensaje solo llega al backend estando en `RUNNING`, así que `st` casi siempr
 | Código | Motivo | Lectura |
 |---|---|---|
 | 1 | `POWERON` | Encendido o corte de energía. En el ESP32 clásico **el botón EN también se reporta así**. |
-| 3 | `SW` | `esp_restart()` (reinicio pedido por el firmware). |
+| 3 | `SW` | `esp_restart()`: reinicio pedido por el firmware o por el comando `reboot` del backend. |
 | 4 | `PANIC` | Excepción o crash. Revisar logs seriales. |
 | 5 | `INT_WDT` | Watchdog de interrupciones: algo bloqueó una interrupción. |
 | 6 | `TASK_WDT` | Watchdog de tareas: una tarea no devolvió la CPU. |
@@ -98,6 +98,10 @@ Un mensaje solo llega al backend estando en `RUNNING`, así que `st` casi siempr
 ```sql
 SELECT id, last_diag, last_diag_at FROM scooters ORDER BY id;
 ```
+
+## Comandos relacionados
+
+Para consultar o actuar sobre el GPS a distancia (`gps_status`, `gps_recycle`, `gps_cold`, `reboot`): `backend-ewood/docs/COMANDOS_EMERGENCIA.md`.
 
 ## Evolución
 
